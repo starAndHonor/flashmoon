@@ -12,3 +12,10 @@ import {
   "chnlkw/moonxi-net/nparray" @nparray_test,
   "moonbitlang/core/bench",
 } for "test"
+
+options(
+  targets: {
+    "kernel_wasm.mbt": [ "wasm" ],
+    "kernel_scalar.mbt": [ "wasm-gc", "js", "native", "llvm" ],
+  },
+)

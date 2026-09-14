@@ -1,8 +1,12 @@
-/// FlashAttention forward pass for MoonBit, built on moonxi-net's NpArray.
+///| FlashAttention forward pass for MoonBit, built on moonxi-net's NpArray.
 ///
 /// Single-head scaled dot-product attention over 2D row-major tensors:
 ///   q: [n, d], k: [m, d], v: [m, dv]  →  out: [n, dv]
 ///   out = softmax(q · kᵀ / √d) · v
+///
+/// Hot loops run on little-endian f32 byte buffers through `kdot` / `kaxpy`
+/// / `kscale`, which are wasm SIMD (f32x4) kernels on the wasm target and
+/// scalar fallbacks elsewhere (see kernel_wasm.mbt / kernel_scalar.mbt).
 
 ///|
 /// Extract row-major data and 2D shape; aborts on non-2D input.
@@ -45,32 +49,22 @@ fn extract_qkv(
 }
 
 ///|
-/// Dot product of two length-`d` row segments at base offsets `qb` / `kb`.
-/// Four accumulators break the FMA dependency chain.
-fn dot_rows(
-  qd : FixedArray[Float],
-  qb : Int,
-  kd : FixedArray[Float],
-  kb : Int,
-  d : Int,
-) -> Float {
-  let mut s0 = 0.0F
-  let mut s1 = 0.0F
-  let mut s2 = 0.0F
-  let mut s3 = 0.0F
-  let mut t = 0
-  while t + 4 <= d {
-    s0 += qd.unsafe_get(qb + t) * kd.unsafe_get(kb + t)
-    s1 += qd.unsafe_get(qb + t + 1) * kd.unsafe_get(kb + t + 1)
-    s2 += qd.unsafe_get(qb + t + 2) * kd.unsafe_get(kb + t + 2)
-    s3 += qd.unsafe_get(qb + t + 3) * kd.unsafe_get(kb + t + 3)
-    t += 4
+/// Convert a byte-buffer row block [rows, dv] at element base `src_base`
+/// into a fresh float tensor row-major [rows, dv]... into `out` at `dst_base`.
+fn copy_rows_out(
+  acc : FixedArray[Byte],
+  out : FixedArray[Float],
+  rows : Int,
+  dv : Int,
+  i0 : Int,
+) -> Unit {
+  for r in 0..<rows {
+    let abase = r * dv
+    let obase = (i0 + r) * dv
+    for c in 0..<dv {
+      out.unsafe_set(obase + c, get_f32(acc, abase + c))
+    }
   }
-  while t < d {
-    s0 += qd.unsafe_get(qb + t) * kd.unsafe_get(kb + t)
-    t += 1
-  }
-  s0 + s1 + (s2 + s3)
 }
 
 ///|
@@ -83,14 +77,17 @@ pub fn naive_attention(
 ) -> @nparray.NpArray {
   let (qd, kd, vd, n, m, d, dv) = extract_qkv(q, k, v)
   let scale = 1.0F / Float::from_int(d).sqrt()
-  let out = FixedArray::make(n * dv, 0.0F)
+  let qbytes = floats_to_bytes(qd)
+  let kbytes = floats_to_bytes(kd)
+  let vbytes = floats_to_bytes(vd)
+  let out = FixedArray::make(n * dv * 4, b'\x00')
   let scores = FixedArray::make(m, 0.0F)
   for i in 0..<n {
     // S_i = q_i · kᵀ · scale, tracking the row max for stability
     let qbase = i * d
     let mut row_max = @float.neg_infinity
     for j in 0..<m {
-      let sj = dot_rows(qd, qbase, kd, j * d, d) * scale
+      let sj = kdot(qbytes, qbase, kbytes, j * d, d) * scale
       scores.unsafe_set(j, sj)
       if sj > row_max {
         row_max = sj
@@ -103,27 +100,15 @@ pub fn naive_attention(
       scores.unsafe_set(j, p)
       row_sum += p
     }
-    // out_i = (P_i · v) / sum; j-outer/c-inner keeps v access sequential
-    let obase = i * dv
-    for c in 0..<dv {
-      out.unsafe_set(obase + c, 0.0F)
-    }
+    // out_i = P_i · v (accumulate), then divide by the softmax sum
     for j in 0..<m {
-      let p = scores.unsafe_get(j)
-      let vbase = j * dv
-      for c in 0..<dv {
-        out.unsafe_set(
-          obase + c,
-          out.unsafe_get(obase + c) + p * vd.unsafe_get(vbase + c),
-        )
-      }
+      kaxpy(out, i * dv, scores.unsafe_get(j), vbytes, j * dv, dv)
     }
-    let inv = 1.0F / row_sum
-    for c in 0..<dv {
-      out.unsafe_set(obase + c, out.unsafe_get(obase + c) * inv)
-    }
+    kscale(out, i * dv, 1.0F / row_sum, dv)
   }
-  @tensor.Tensor::from_host(out, [n, dv])
+  let out_f = FixedArray::make(n * dv, 0.0F)
+  copy_rows_out(out, out_f, n, dv, 0)
+  @tensor.Tensor::from_host(out_f, [n, dv])
 }
 
 ///|
@@ -145,12 +130,15 @@ pub fn flash_attention(
     abort("block sizes must be positive")
   }
   let scale = 1.0F / Float::from_int(d).sqrt()
-  let out = FixedArray::make(n * dv, 0.0F)
+  let qbytes = floats_to_bytes(qd)
+  let kbytes = floats_to_bytes(kd)
+  let vbytes = floats_to_bytes(vd)
   // Per-block scratch buffers
   let s_blk = FixedArray::make(block_rows * block_cols, 0.0F)
   let m_run = FixedArray::make(block_rows, 0.0F)
   let l_run = FixedArray::make(block_rows, 0.0F)
-  let acc = FixedArray::make(block_rows * dv, 0.0F)
+  let acc = FixedArray::make(block_rows * dv * 4, b'\x00')
+  let out = FixedArray::make(n * dv, 0.0F)
   let n_row_blocks = (n + block_rows - 1) / block_rows
   let n_col_blocks = (m + block_cols - 1) / block_cols
   for bi in 0..<n_row_blocks {
@@ -158,7 +146,7 @@ pub fn flash_attention(
     let rows = if block_rows < n - i0 { block_rows } else { n - i0 }
     m_run.fill(@float.neg_infinity)
     l_run.fill(0.0F)
-    acc.fill(0.0F)
+    kscale(acc, 0, 0.0F, rows * dv) // reset accumulator
     for bj in 0..<n_col_blocks {
       let j0 = bj * block_cols
       let cols = if block_cols < m - j0 { block_cols } else { m - j0 }
@@ -169,7 +157,7 @@ pub fn flash_attention(
         for c in 0..<cols {
           s_blk.unsafe_set(
             sbase + c,
-            dot_rows(qd, qbase, kd, (j0 + c) * d, d) * scale,
+            kdot(qbytes, qbase, kbytes, (j0 + c) * d, d) * scale,
           )
         }
       }
@@ -193,33 +181,26 @@ pub fn flash_attention(
         }
         l_run.unsafe_set(r, l_run.unsafe_get(r) * alpha + psum)
         // acc = alpha * acc + P_blk · v_blk
-        // rescale row, then j-outer/c-inner accumulate: v and acc stay sequential
         let abase = r * dv
-        for c in 0..<dv {
-          acc.unsafe_set(abase + c, acc.unsafe_get(abase + c) * alpha)
-        }
+        kscale(acc, abase, alpha, dv)
         for j in 0..<cols {
-          let p = s_blk.unsafe_get(sbase + j)
-          let vbase = (j0 + j) * dv
-          for c in 0..<dv {
-            acc.unsafe_set(
-              abase + c,
-              acc.unsafe_get(abase + c) + p * vd.unsafe_get(vbase + c),
-            )
-          }
+          kaxpy(
+            acc,
+            abase,
+            s_blk.unsafe_get(sbase + j),
+            vbytes,
+            (j0 + j) * dv,
+            dv,
+          )
         }
         m_run.unsafe_set(r, mx)
       }
     }
-    // Normalize by the softmax denominator
+    // Normalize by the softmax denominator, then copy rows out
     for r in 0..<rows {
-      let inv = 1.0F / l_run.unsafe_get(r)
-      let abase = r * dv
-      let obase = (i0 + r) * dv
-      for c in 0..<dv {
-        out.unsafe_set(obase + c, acc.unsafe_get(abase + c) * inv)
-      }
+      kscale(acc, r * dv, 1.0F / l_run.unsafe_get(r), dv)
     }
+    copy_rows_out(acc, out, rows, dv, i0)
   }
   @tensor.Tensor::from_host(out, [n, dv])
 }
