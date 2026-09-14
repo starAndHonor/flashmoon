@@ -3,10 +3,12 @@ import {
   "chnlkw/moonxi-net" @tensor,
   "moonbitlang/core/math",
   "moonbitlang/core/float",
+  "moonbitlang/core/bench",
 }
 
 import {
   "starAndHonor/flashmoon",
   "chnlkw/moonxi-net" @tensor_test,
   "chnlkw/moonxi-net/nparray" @nparray_test,
+  "moonbitlang/core/bench",
 } for "test"

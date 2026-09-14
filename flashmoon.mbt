@@ -1,4 +1,3 @@
-///|
 /// FlashAttention forward pass for MoonBit, built on moonxi-net's NpArray.
 ///
 /// Single-head scaled dot-product attention over 2D row-major tensors:
@@ -46,6 +45,35 @@ fn extract_qkv(
 }
 
 ///|
+/// Dot product of two length-`d` row segments at base offsets `qb` / `kb`.
+/// Four accumulators break the FMA dependency chain.
+fn dot_rows(
+  qd : FixedArray[Float],
+  qb : Int,
+  kd : FixedArray[Float],
+  kb : Int,
+  d : Int,
+) -> Float {
+  let mut s0 = 0.0F
+  let mut s1 = 0.0F
+  let mut s2 = 0.0F
+  let mut s3 = 0.0F
+  let mut t = 0
+  while t + 4 <= d {
+    s0 += qd.unsafe_get(qb + t) * kd.unsafe_get(kb + t)
+    s1 += qd.unsafe_get(qb + t + 1) * kd.unsafe_get(kb + t + 1)
+    s2 += qd.unsafe_get(qb + t + 2) * kd.unsafe_get(kb + t + 2)
+    s3 += qd.unsafe_get(qb + t + 3) * kd.unsafe_get(kb + t + 3)
+    t += 4
+  }
+  while t < d {
+    s0 += qd.unsafe_get(qb + t) * kd.unsafe_get(kb + t)
+    t += 1
+  }
+  s0 + s1 + (s2 + s3)
+}
+
+///|
 /// Naive reference attention: materializes the full [n, m] score matrix,
 /// applies row softmax, then multiplies by v.
 pub fn naive_attention(
@@ -59,14 +87,11 @@ pub fn naive_attention(
   let scores = FixedArray::make(m, 0.0F)
   for i in 0..<n {
     // S_i = q_i · kᵀ · scale, tracking the row max for stability
+    let qbase = i * d
     let mut row_max = @float.neg_infinity
     for j in 0..<m {
-      let mut s = 0.0F
-      for t in 0..<d {
-        s += qd[i * d + t] * kd[j * d + t]
-      }
-      let sj = s * scale
-      scores[j] = sj
+      let sj = dot_rows(qd, qbase, kd, j * d, d) * scale
+      scores.unsafe_set(j, sj)
       if sj > row_max {
         row_max = sj
       }
@@ -74,17 +99,28 @@ pub fn naive_attention(
     // softmax in place: scores[j] = exp(sj - max), normalized below
     let mut row_sum = 0.0F
     for j in 0..<m {
-      let p = @math.expf(scores[j] - row_max)
-      scores[j] = p
+      let p = @math.expf(scores.unsafe_get(j) - row_max)
+      scores.unsafe_set(j, p)
       row_sum += p
     }
-    // out_i = (P_i · v) / sum
+    // out_i = (P_i · v) / sum; j-outer/c-inner keeps v access sequential
+    let obase = i * dv
     for c in 0..<dv {
-      let mut acc = 0.0F
-      for j in 0..<m {
-        acc += scores[j] * vd[j * dv + c]
+      out.unsafe_set(obase + c, 0.0F)
+    }
+    for j in 0..<m {
+      let p = scores.unsafe_get(j)
+      let vbase = j * dv
+      for c in 0..<dv {
+        out.unsafe_set(
+          obase + c,
+          out.unsafe_get(obase + c) + p * vd.unsafe_get(vbase + c),
+        )
       }
-      out[i * dv + c] = acc / row_sum
+    }
+    let inv = 1.0F / row_sum
+    for c in 0..<dv {
+      out.unsafe_set(obase + c, out.unsafe_get(obase + c) * inv)
     }
   }
   @tensor.Tensor::from_host(out, [n, dv])
@@ -101,8 +137,8 @@ pub fn flash_attention(
   q : @nparray.NpArray,
   k : @nparray.NpArray,
   v : @nparray.NpArray,
-  block_rows? : Int = 16,
-  block_cols? : Int = 16,
+  block_rows? : Int = 64,
+  block_cols? : Int = 64,
 ) -> @nparray.NpArray {
   let (qd, kd, vd, n, m, d, dv) = extract_qkv(q, k, v)
   if block_rows <= 0 || block_cols <= 0 {
@@ -128,48 +164,60 @@ pub fn flash_attention(
       let cols = if block_cols < m - j0 { block_cols } else { m - j0 }
       // S = q_blk · k_blkᵀ · scale  (rows × cols)
       for r in 0..<rows {
+        let qbase = (i0 + r) * d
+        let sbase = r * block_cols
         for c in 0..<cols {
-          let mut sum = 0.0F
-          for t in 0..<d {
-            sum += qd[(i0 + r) * d + t] * kd[(j0 + c) * d + t]
-          }
-          s_blk[r * block_cols + c] = sum * scale
+          s_blk.unsafe_set(
+            sbase + c,
+            dot_rows(qd, qbase, kd, (j0 + c) * d, d) * scale,
+          )
         }
       }
       // Online softmax update per row of the block
       for r in 0..<rows {
-        let mut mx = m_run[r]
+        let sbase = r * block_cols
+        let mut mx = m_run.unsafe_get(r)
         for c in 0..<cols {
-          let x = s_blk[r * block_cols + c]
+          let x = s_blk.unsafe_get(sbase + c)
           if x > mx {
             mx = x
           }
         }
         // Rescale factor for the running state; exp(-inf) = 0 on the first block
-        let alpha = @math.expf(m_run[r] - mx)
+        let alpha = @math.expf(m_run.unsafe_get(r) - mx)
         let mut psum = 0.0F
         for c in 0..<cols {
-          let p = @math.expf(s_blk[r * block_cols + c] - mx)
-          s_blk[r * block_cols + c] = p
+          let p = @math.expf(s_blk.unsafe_get(sbase + c) - mx)
+          s_blk.unsafe_set(sbase + c, p)
           psum += p
         }
-        l_run[r] = l_run[r] * alpha + psum
+        l_run.unsafe_set(r, l_run.unsafe_get(r) * alpha + psum)
         // acc = alpha * acc + P_blk · v_blk
+        // rescale row, then j-outer/c-inner accumulate: v and acc stay sequential
+        let abase = r * dv
         for c in 0..<dv {
-          let mut o = acc[r * dv + c] * alpha
-          for j in 0..<cols {
-            o += s_blk[r * block_cols + j] * vd[(j0 + j) * dv + c]
-          }
-          acc[r * dv + c] = o
+          acc.unsafe_set(abase + c, acc.unsafe_get(abase + c) * alpha)
         }
-        m_run[r] = mx
+        for j in 0..<cols {
+          let p = s_blk.unsafe_get(sbase + j)
+          let vbase = (j0 + j) * dv
+          for c in 0..<dv {
+            acc.unsafe_set(
+              abase + c,
+              acc.unsafe_get(abase + c) + p * vd.unsafe_get(vbase + c),
+            )
+          }
+        }
+        m_run.unsafe_set(r, mx)
       }
     }
     // Normalize by the softmax denominator
     for r in 0..<rows {
-      let inv = 1.0F / l_run[r]
+      let inv = 1.0F / l_run.unsafe_get(r)
+      let abase = r * dv
+      let obase = (i0 + r) * dv
       for c in 0..<dv {
-        out[(i0 + r) * dv + c] = acc[r * dv + c] * inv
+        out.unsafe_set(obase + c, acc.unsafe_get(abase + c) * inv)
       }
     }
   }
