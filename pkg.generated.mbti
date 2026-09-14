@@ -1,0 +1,20 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "starAndHonor/flashmoon"
+
+import {
+  "chnlkw/moonxi-net/nparray",
+}
+
+// Values
+pub fn flash_attention(@nparray.NpArray, @nparray.NpArray, @nparray.NpArray, block_rows? : Int, block_cols? : Int) -> @nparray.NpArray
+
+pub fn naive_attention(@nparray.NpArray, @nparray.NpArray, @nparray.NpArray) -> @nparray.NpArray
+
+// Errors
+
+// Types and methods
+
+// Type aliases
+
+// Traits
+

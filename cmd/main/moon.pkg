@@ -1,5 +1,7 @@
-// import {
-//   "starAndHonor/flashmoon" @lib,
-// }
+import {
+  "starAndHonor/flashmoon",
+  "chnlkw/moonxi-net" @tensor,
+  "chnlkw/moonxi-net/nparray",
+}
 
 pkgtype(kind: "executable")

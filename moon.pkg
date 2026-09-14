@@ -1,0 +1,12 @@
+import {
+  "chnlkw/moonxi-net/nparray",
+  "chnlkw/moonxi-net" @tensor,
+  "moonbitlang/core/math",
+  "moonbitlang/core/float",
+}
+
+import {
+  "starAndHonor/flashmoon",
+  "chnlkw/moonxi-net" @tensor_test,
+  "chnlkw/moonxi-net/nparray" @nparray_test,
+} for "test"
