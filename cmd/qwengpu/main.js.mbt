@@ -183,7 +183,6 @@ fn rope_tables(g : @gpu.Gpu) -> (@gpu.GPUBuffer, @gpu.GPUBuffer) {
 ///|
 /// Activation scratch for a token batch (rows = s).
 struct GPUAct {
-  rows : Int
   x : @gpu.GPUBuffer
   xn : @gpu.GPUBuffer
   qq : @gpu.GPUBuffer
@@ -199,7 +198,6 @@ struct GPUAct {
 ///|
 fn alloc_act(g : @gpu.Gpu, rows : Int) -> GPUAct {
   {
-    rows,
     x: g.alloc(rows * HID),
     xn: g.alloc(rows * HID),
     qq: g.alloc(rows * NQH * HD),
