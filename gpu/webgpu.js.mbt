@@ -186,6 +186,27 @@ pub extern "js" fn GPUDevice::create_pipeline_and_bind_group2(
   #|}
 
 ///|
+/// Bare compute pipeline (layout auto) — cacheable by shader+dims key.
+pub extern "js" fn GPUDevice::create_pipeline(
+  self : GPUDevice,
+  module_ : GPUShaderModule,
+  entry_point : String,
+) -> GPUComputePipeline =
+  #|(self, module, entryPoint) => self.createComputePipeline({ layout: 'auto', compute: { module, entryPoint } })
+
+///|
+/// Bind group for a pipeline: binding i = bufs[i].
+pub extern "js" fn GPUDevice::make_bind_group(
+  self : GPUDevice,
+  pipeline : GPUComputePipeline,
+  bufs : FixedArray[GPUBuffer],
+) -> GPUBindGroup =
+  #|(self, pipeline, bufs) => self.createBindGroup({
+  #|  layout: pipeline.getBindGroupLayout(0),
+  #|  entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })),
+  #|})
+
+///|
 pub type GPUBindGroupWithPipeline
 
 ///|
@@ -269,3 +290,11 @@ pub extern "js" fn GPUQueue::submit(
   command_buffers : Array[GPUCommandBuffer],
 ) -> Unit =
   #|(self, commandBuffers) => self.submit(commandBuffers)
+
+///|
+/// Resolves (cb ignored-arg) when all submitted work has finished.
+pub extern "js" fn GPUQueue::on_submitted_done(
+  self : GPUQueue,
+  cb : (Bool) -> Unit,
+) -> Unit =
+  #|(self, cb) => self.onSubmittedWorkDone().then(cb)

@@ -283,3 +283,110 @@ pub fn combine_shader(n : Int, dv : Int, splits : Int) -> String {
     $|}
   src
 }
+
+///|
+/// GEMV kernel: y[out] = W[out, in] @ x[in], W row-major.
+///
+/// 256-thread workgroup covers 8 output rows (one 32-lane warp per row):
+/// x staged in shared as vec4 (<= 12KB for in <= 3072), lanes stream their
+/// row with coalesced 512B-per-instruction vec4 reads, then a per-warp
+/// shared reduction (8 rows reduced in parallel). Grid:
+/// (ceil(out/8), 1). Requires in % 4 == 0.
+pub fn gemv_shader(out : Int, inn : Int) -> String {
+  let in4 = inn / 4
+  let src =
+    $|@group(0) @binding(0) var<storage, read> w : array<vec4<f32>>;
+    $|@group(0) @binding(1) var<storage, read> x : array<vec4<f32>>;
+    $|@group(0) @binding(2) var<storage, read_write> y : array<f32>;
+    $|
+    $|const OUT : u32 = \{out}u;
+    $|const IN4 : u32 = \{in4}u;
+    $|
+    $|var<workgroup> xs : array<vec4<f32>, 768>;
+    $|var<workgroup> part : array<f32, 256>;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let rg = lid.x / 32u; // row group (warp) 0..7
+    $|  let lane = lid.x % 32u;
+    $|  let o = wid.x * 8u + rg;
+    $|  let oo = min(o, OUT - 1u);
+    $|  for (var t = lid.x; t < IN4; t = t + 256u) {
+    $|    xs[t] = x[t];
+    $|  }
+    $|  workgroupBarrier();
+    $|  var acc = 0.0;
+    $|  for (var t = lane; t < IN4; t = t + 32u) {
+    $|    acc = acc + dot(w[oo * IN4 + t], xs[t]);
+    $|  }
+    $|  part[lid.x] = acc;
+    $|  workgroupBarrier();
+    $|  if (lane == 0u && o < OUT) {
+    $|    var sum = 0.0;
+    $|    for (var t = 0u; t < 32u; t = t + 1u) {
+    $|      sum = sum + part[rg * 32u + t];
+    $|    }
+    $|    y[o] = sum;
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// GEMM kernel: Y[s, out] = X[s, in] @ W[out, in]^T, both row-major.
+///
+/// Classic 16x16 output tile per 256-thread workgroup; k streamed in
+/// 4-vec4 chunks through shared memory (2KB tiles), each thread owns one
+/// output element and accumulates with vec4 dots. Edges zero-padded via
+/// select. Requires in % 4 == 0.
+pub fn matmul_shader(s : Int, out : Int, inn : Int) -> String {
+  let in4 = inn / 4
+  let src =
+    $|@group(0) @binding(0) var<storage, read> x : array<vec4<f32>>;
+    $|@group(0) @binding(1) var<storage, read> w : array<vec4<f32>>;
+    $|@group(0) @binding(2) var<storage, read_write> y : array<f32>;
+    $|
+    $|const S : u32 = \{s}u;
+    $|const OUT : u32 = \{out}u;
+    $|const IN4 : u32 = \{in4}u;
+    $|
+    $|var<workgroup> xs : array<vec4<f32>, 64>;
+    $|var<workgroup> ws : array<vec4<f32>, 64>;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let col0 = wid.x * 16u;
+    $|  let row0 = wid.y * 16u;
+    $|  let tx = lid.x % 16u;
+    $|  let ty = lid.x / 16u;
+    $|  var acc = 0.0;
+    $|  for (var k0 = 0u; k0 < IN4; k0 = k0 + 4u) {
+    $|    for (var t = lid.x; t < 64u; t = t + 256u) {
+    $|      let r = t / 4u;
+    $|      let c = t % 4u;
+    $|      let gi = row0 + r;
+    $|      let kk = k0 + c;
+    $|      xs[t] = select(vec4<f32>(0.0), x[gi * IN4 + kk], gi < S && kk < IN4);
+    $|      let gj = col0 + r;
+    $|      ws[t] = select(vec4<f32>(0.0), w[gj * IN4 + kk], gj < OUT && kk < IN4);
+    $|    }
+    $|    workgroupBarrier();
+    $|    for (var kk = 0u; kk < 4u; kk = kk + 1u) {
+    $|      acc = acc + dot(xs[ty * 4u + kk], ws[tx * 4u + kk]);
+    $|    }
+    $|    workgroupBarrier();
+    $|  }
+    $|  let gi = row0 + ty;
+    $|  let gj = col0 + tx;
+    $|  if (gi < S && gj < OUT) {
+    $|    y[gi * OUT + gj] = acc;
+    $|  }
+    $|}
+  src
+}
