@@ -50,7 +50,7 @@ extern "js" fn GPU::request_adapter_cb(
   self : GPU,
   cb : (GPUAdapter) -> Unit,
 ) -> Unit =
-  #|(self, cb) => self.requestAdapter().then(cb)
+  #|(self, cb) => self.requestAdapter({ powerPreference: "high-performance" }).then(cb)
 
 ///|
 pub fn GPU::request_adapter(self : GPU, cb : (GPUAdapter) -> Unit) -> Unit {
@@ -110,6 +110,10 @@ pub extern "js" fn GPUDevice::on_uncaptured_error(
   #|(self, cb) => self.addEventListener("uncapturederror", (e) => cb(e.error.message))
 
 ///|
+pub extern "js" fn GPUAdapter::info_string(self : GPUAdapter) -> String =
+  #|(self) => self.info ? `${self.info.vendor}|${self.info.architecture}|${self.info.device || ""}|${self.info.description || ""}` : "noinfo"
+
+///|
 extern "js" fn GPUBuffer::map_async_cb(
   self : GPUBuffer,
   mode : Int,
@@ -154,6 +158,28 @@ pub extern "js" fn GPUDevice::create_pipeline_and_bind_group(
   #|      { binding: 1, resource: { buffer: b1 } },
   #|      { binding: 2, resource: { buffer: b2 } },
   #|      { binding: 3, resource: { buffer: b3 } },
+  #|    ],
+  #|  });
+  #|  return { pipeline, bindGroup };
+  #|}
+
+///|
+/// Same as `create_pipeline_and_bind_group` but for two buffers:
+/// binding 0 = read-only partials, 1 = output.
+pub extern "js" fn GPUDevice::create_pipeline_and_bind_group2(
+  self : GPUDevice,
+  module_ : GPUShaderModule,
+  entry_point : String,
+  b0 : GPUBuffer,
+  b1 : GPUBuffer,
+) -> GPUBindGroupWithPipeline =
+  #|(self, module, entryPoint, b0, b1) => {
+  #|  const pipeline = self.createComputePipeline({ layout: 'auto', compute: { module, entryPoint } });
+  #|  const bindGroup = self.createBindGroup({
+  #|    layout: pipeline.getBindGroupLayout(0),
+  #|    entries: [
+  #|      { binding: 0, resource: { buffer: b0 } },
+  #|      { binding: 1, resource: { buffer: b1 } },
   #|    ],
   #|  });
   #|  return { pipeline, bindGroup };

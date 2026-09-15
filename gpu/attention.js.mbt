@@ -53,8 +53,27 @@ fn upload(
 }
 
 ///|
+/// Key-split count for the split-K path: ~256 keys per workgroup,
+/// clamped to [1, 32]. Grid.y = ceil(n/64) must stay under 65535.
+fn pick_splits(m : Int) -> Int {
+  let s = (m + 127) / 128
+  if s < 1 {
+    1
+  } else if s > 32 {
+    32
+  } else {
+    s
+  }
+}
+
+///|
 /// Flash attention forward on GPU: q [n,d], k [m,d], v [m,dv] → [n,dv].
 /// Callback-style (MoonBit async intrinsics crash moonc v0.10.5 on js).
+///
+/// Fast path (d <= 64, dv <= 64): split-K — kernel 1 computes per-(row,
+/// key-chunk) online-softmax partials (32 threads/workgroup), kernel 2
+/// merges them. Fallback (64 < dv <= 128): single tiled kernel, one
+/// thread per query row.
 pub fn flash_attention_gpu(
   q : @nparray.NpArray,
   k : @nparray.NpArray,
@@ -71,15 +90,21 @@ pub fn flash_attention_gpu(
   if dv > 128 {
     abort("dv > 128 not supported by the WGSL register array")
   }
+  if (n + 63) / 64 > 65535 {
+    abort("ceil(n/64) > 65535 exceeds the dispatch grid.y limit")
+  }
+  let split_k = d <= 64 && dv <= 64 && d % 4 == 0 && dv % 4 == 0
   let t_start = now_ms()
   gpu().request_adapter(fn(adapter) {
     adapter.request_device(fn(device) {
+      log("adapter: \{adapter.info_string()}")
       let t_device = now_ms()
       log(
         "device maxComputeWorkgroupStorageSize=\{device.max_workgroup_storage()}",
       )
-      let smem_need = 16 * d * 4 + 16 * dv * 4 // BC=16 tiles for K and V
       device.on_uncaptured_error(fn(msg) { log("GPU error: \{msg}") })
+      // Both kernels stage BC=16 K/V tiles: 16 * (d + dv) * 4 bytes.
+      let smem_need = 16 * d * 4 + 16 * dv * 4
       if smem_need > device.max_workgroup_storage() {
         abort(
           "shader needs \{smem_need}B workgroup storage, device allows \{device.max_workgroup_storage()}B",
@@ -94,18 +119,49 @@ pub fn flash_attention_gpu(
         USAGE_STORAGE | USAGE_COPY_SRC,
         mapped_at_creation=false,
       )
-      // Pipeline + bind group (layout auto)
-      let shader = device.create_shader_module(attention_shader(n, m, d, dv))
-      let pp = device.create_pipeline_and_bind_group(
-        shader, "main", qb, kb, vb, outb,
-      )
-      let t_upload = now_ms()
-      // Encode + submit
       let encoder = device.create_command_encoder()
       let pass = encoder.begin_compute_pass()
-      pass.set_pipeline(pp.pipeline())
-      pass.set_bind_group(0, pp.bind_group())
-      pass.dispatch_workgroups((n + 63) / 64, 1, 1)
+      if split_k {
+        let splits = pick_splits(m)
+        let partb = device.create_buffer(
+          n * splits * (dv + 4) * 4,
+          USAGE_STORAGE,
+          mapped_at_creation=false,
+        )
+        let pp1 = device.create_pipeline_and_bind_group(
+          device.create_shader_module(partial_shader(n, m, d, dv, splits)),
+          "main",
+          qb,
+          kb,
+          vb,
+          partb,
+        )
+        let pp2 = device.create_pipeline_and_bind_group2(
+          device.create_shader_module(combine_shader(n, dv, splits)),
+          "main",
+          partb,
+          outb,
+        )
+        pass.set_pipeline(pp1.pipeline())
+        pass.set_bind_group(0, pp1.bind_group())
+        pass.dispatch_workgroups(splits, (n + 63) / 64, 1)
+        pass.set_pipeline(pp2.pipeline())
+        pass.set_bind_group(0, pp2.bind_group())
+        pass.dispatch_workgroups((n * (dv / 4) + 255) / 256, 1, 1)
+        log("split-K: splits=\{splits} workgroups1=\{splits * ((n + 63) / 64)}")
+      } else {
+        let pp = device.create_pipeline_and_bind_group(
+          device.create_shader_module(attention_shader(n, m, d, dv)),
+          "main",
+          qb,
+          kb,
+          vb,
+          outb,
+        )
+        pass.set_pipeline(pp.pipeline())
+        pass.set_bind_group(0, pp.bind_group())
+        pass.dispatch_workgroups((n + 63) / 64, 1, 1)
+      }
       pass.end()
       let readb = device.create_buffer(
         n * dv * 4,
@@ -116,11 +172,11 @@ pub fn flash_attention_gpu(
       device.get_queue().submit([encoder.finish()])
       let t_submit = now_ms()
       log(
-        "  stages: init=\{t_device - t_start}ms upload+pipeline=\{t_upload - t_device}ms encode+submit=\{t_submit - t_upload}ms",
+        "  stages: init=\{t_device - t_start}ms upload+pipeline+encode+submit=\{t_submit - t_device}ms",
       )
       readb.map_async(MAP_MODE_READ, fn(_) {
         let t_done = now_ms()
-        log("  gpu wait (kernel+copy+map): \{t_done - t_submit}ms")
+        log("  gpu wait (kernels+copy+map): \{t_done - t_submit}ms")
         let result = readb.get_float_array()
         readb.unmap()
         on_done(@tensor.Tensor::from_host(result, [n, dv]))
