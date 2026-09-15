@@ -46,7 +46,7 @@ pub fn Tokenizer::load(json : String) -> Tokenizer raise {
   guard top["model"] is Object(m) else { fail("no model") }
   guard m["vocab"] is Object(vocab) else { fail("no vocab") }
   let id_to_tok : Array[String] = Array::make(vocab.length(), "")
-  let tok_to_id : Map[String, Int] = {}
+  let tok_to_id : Map[String, Int] = Map([])
   for tok, idj in vocab {
     guard idj is Number(id, ..) else { fail("vocab id not number") }
     let id = id.to_int()
@@ -54,7 +54,7 @@ pub fn Tokenizer::load(json : String) -> Tokenizer raise {
     tok_to_id[tok] = id
   }
   guard m["merges"] is Array(merges) else { fail("no merges") }
-  let merge_rank : Map[String, Int] = {}
+  let merge_rank : Map[String, Int] = Map([])
   for i, mj in merges {
     // both formats seen in the wild: ["a", "b"] or "a b"
     let pair = match mj {
@@ -81,7 +81,7 @@ pub fn Tokenizer::load(json : String) -> Tokenizer raise {
       tok_to_id[content] = id
     }
   }
-  let char_to_byte : Map[Char, Int] = {}
+  let char_to_byte : Map[Char, Int] = Map([])
   let table = byte_to_unicode()
   for b in 0..<256 {
     char_to_byte[table[b]] = b
@@ -235,7 +235,7 @@ fn pretokenize(text : String) -> Array[String] {
 // ---------- BPE ----------
 
 ///| Map a pre-token's chars to the byte-level token string.
-fn Tokenizer::to_byte_level(self : Tokenizer, s : String) -> String raise {
+fn to_byte_level(s : String) -> String {
   let bytes = @utf8.encode(s)
   let sb = StringBuilder::new()
   let table = byte_to_unicode()
@@ -246,14 +246,14 @@ fn Tokenizer::to_byte_level(self : Tokenizer, s : String) -> String raise {
 }
 
 ///| BPE-merge one byte-level word into vocab token strings.
-fn Tokenizer::bpe(self : Tokenizer, word : String) -> Array[String] raise {
+fn Tokenizer::bpe(self : Tokenizer, word : String) -> Array[String] {
   let mut parts : Array[String] = word.iter().map(fn(c) { c.to_string() }).collect()
   if parts.length() <= 1 {
     return parts
   }
   for ;; {
     // find lowest-rank adjacent pair
-    let mut best_rank = @int.max_value
+    let mut best_rank = @int.MAX_VALUE
     let mut best_i = -1
     for k in 0..<(parts.length() - 1) {
       match self.merge_rank.get(parts[k] + "\u{1}" + parts[k + 1]) {
@@ -293,7 +293,7 @@ fn Tokenizer::bpe(self : Tokenizer, word : String) -> Array[String] raise {
 pub fn Tokenizer::encode(self : Tokenizer, text : String) -> Array[Int] raise {
   let out : Array[Int] = []
   for pre in pretokenize(text) {
-    let word = self.to_byte_level(pre)
+    let word = to_byte_level(pre)
     for tok in self.bpe(word) {
       match self.tok_to_id.get(tok) {
         Some(id) => out.push(id)
