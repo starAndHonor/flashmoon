@@ -1,4 +1,4 @@
-// WebGPU host for cmd/web: runs the MoonBit JS bundle on a real GPU via
+// WebGPU host for cmd/gpubench: runs the MoonBit JS bundle on a real GPU via
 // Deno's wgpu (Vulkan) backend — no browser, works headless.
 //
 // Usage: moon build --target js && deno run --allow-read scripts/webgpu_host.js
@@ -13,6 +13,6 @@ globalThis.fetch = async (url, opt) => {
 };
 
 const bundle = new TextDecoder().decode(
-  await Deno.readFile(new URL("../_build/js/debug/build/cmd/web/web.js", import.meta.url)),
+  await Deno.readFile(new URL("../_build/js/debug/build/cmd/gpubench/gpubench.js", import.meta.url)),
 );
 eval(bundle);

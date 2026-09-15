@@ -47,3 +47,20 @@ Measured on RTX 4060 Laptop: prefill ~300 ms (short prompts), decode
 ~11 ms/tok in Chrome/Dawn (~30 ms/tok under Deno/wgpu). Chrome rejects
 writable-storage binding aliasing that wgpu tolerates — all dispatches are
 alias-free (single-binding in-place or out-of-place).
+
+## Repository layout
+
+```
+flashmoon.mbt / kernel_*.mbt   FlashAttention-2 (wasm/native, f32x4 SIMD) — root package
+gpu/                           WebGPU runtime + compute kernels (js target)
+qwen/                          safetensors parser + Qwen2 byte-level BPE tokenizer
+qwenrun/                       Qwen3-0.6B runner core (host-agnostic: read/log injected)
+cmd/fa/                         FA2 naive-vs-flash demo (wasm/native)
+cmd/bench/                      FA2 benchmark harness (wasm)
+cmd/gpubench/                   WebGPU kernel checks + benchmarks (Deno host)
+cmd/qwencpu/                   Qwen3 CPU reference runner + tokenizer oracle test
+cmd/qwengpu/                    Deno REPL chat (MATCH gate + slash commands)
+cmd/webchat/                    browser chat page (chat.html + DOM frontend)
+refs/                           model + HF reference data (gitignored, ~1.5 GB)
+scripts/                         Deno host shims (webgpu_host.js, qwengpu_host.js)
+```
