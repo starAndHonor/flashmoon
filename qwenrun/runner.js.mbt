@@ -15,6 +15,10 @@ extern "js" fn now_ms() -> Double =
   #|() => performance.now()
 
 ///|
+extern "js" fn randf() -> Double =
+  #|() => Math.random()
+
+///|
 extern "js" fn bytes_to_string(b : Bytes) -> String =
   #|(b) => new TextDecoder().decode(b)
 
@@ -433,6 +437,90 @@ pub fn Runner::readback_logits(
 }
 
 ///|
+/// Sampling hyperparameters. `temp <= 0` = greedy (GPU argmax fast path).
+pub struct Sampler {
+  temp : Double
+  top_k : Int
+  top_p : Double
+}
+
+///|
+pub fn Sampler::greedy() -> Sampler {
+  { temp: 0.0, top_k: 1, top_p: 1.0 }
+}
+
+///|
+pub fn Sampler::new(temp : Double, top_k : Int, top_p : Double) -> Sampler {
+  { temp, top_k, top_p }
+}
+
+///|
+pub fn Sampler::temp(self : Sampler) -> Double {
+  self.temp
+}
+
+///|
+pub fn Sampler::top_k(self : Sampler) -> Int {
+  self.top_k
+}
+
+///|
+pub fn Sampler::top_p(self : Sampler) -> Double {
+  self.top_p
+}
+
+///|
+/// CPU sampling over the full logits: temperature scale → top-k → nucleus
+/// (top-p) → softmax draw. Only used when `temp > 0`; the greedy path
+/// stays on the GPU argmax (no 607KB logits readback per token).
+fn sample_logits(
+  logits : FixedArray[Float],
+  temp : Double,
+  top_k : Int,
+  top_p : Double,
+) -> Int {
+  let n = logits.length()
+  // (scaled logit, id) pairs, descending by logit
+  let pairs : Array[(Double, Int)] = Array::makei(n, fn(i) {
+    (logits[i].to_double() / temp, i)
+  })
+  pairs.sort_by(fn(a, b) { b.0.compare(a.0) })
+  let keep = if top_k > 0 && top_k < n { top_k } else { n }
+  let mx = pairs[0].0
+  let mut sum = 0.0
+  let probs : Array[Double] = []
+  let ids : Array[Int] = []
+  for i in 0..<keep {
+    let p = @math.exp(pairs[i].0 - mx)
+    probs.push(p)
+    ids.push(pairs[i].1)
+    sum += p
+  }
+  // nucleus: cut the tail beyond top_p of the cumulative mass
+  let mut cutoff = probs.length()
+  let mut acc = 0.0
+  for i in 0..<probs.length() {
+    acc += probs[i] / sum
+    if acc >= top_p {
+      cutoff = i + 1
+      break
+    }
+  }
+  let mut cum = 0.0
+  for i in 0..<cutoff {
+    cum += probs[i]
+  }
+  let mut r = randf() * cum
+  for i in 0..<cutoff {
+    r -= probs[i]
+    if r <= 0.0 {
+      return ids[i]
+    }
+  }
+  ids[cutoff - 1]
+}
+
+///|
 /// Greedy decode one token, then recurse from the argmax callback.
 fn decode_step(
   r : Runner,
@@ -442,6 +530,7 @@ fn decode_step(
   out : Array[Int],
   sd : @qwen3.StreamDecoder,
   on_token : (String) -> Unit,
+  sampler : Sampler,
   t0 : Double,
   verbose : Bool,
   done : (String, Int) -> Unit,
@@ -465,7 +554,7 @@ fn decode_step(
   g.matvec(r.model.w["embed"], r.act.xn, r.logits, VOCAB, HID)
   g.flush()
   let te = now_ms()
-  g.argmax(r.logits, VOCAB, r.am_v, r.am_i, r.am_o, fn(am) {
+  let advance = fn(am : Int) {
     if verbose {
       (r.log)(
         "step pos=\{pos}: encode=\{(te - ts).to_int()}ms total=\{(now_ms() - ts).to_int()}ms",
@@ -476,28 +565,40 @@ fn decode_step(
     if piece != "" {
       on_token(piece)
     }
-    decode_step(r, am, pos + 1, remaining - 1, out, sd, on_token, t0, verbose, done)
-  })
+    decode_step(
+      r, am, pos + 1, remaining - 1, out, sd, on_token, sampler, t0, verbose, done,
+    )
+  }
+  if sampler.temp <= 0.0 {
+    g.argmax(r.logits, VOCAB, r.am_v, r.am_i, r.am_o, advance)
+  } else {
+    g.readback(r.logits, VOCAB, fn(got) {
+      advance(sample_logits(got, sampler.temp, sampler.top_k, sampler.top_p))
+    })
+  }
 }
 
 ///|
-/// Greedy decode `max` tokens starting from `first` at position `pos`
-/// (stops early at <|endoftext|>/<|im_end|>). on_token fires with
-/// UTF-8-safe incremental text; on_done(text, n_tokens, ms).
+/// Decode `max` tokens starting from `first` at position `pos` (stops
+/// early at <|endoftext|>/<|im_end|>). `sampler.temp <= 0` = greedy GPU
+/// argmax; otherwise CPU temperature/top-k/top-p sampling. on_token fires
+/// with UTF-8-safe incremental text; on_done(text, n_tokens, ms).
 pub fn Runner::decode_greedy(
   self : Runner,
   first : Int,
   pos : Int,
   max : Int,
+  sampler : Sampler,
   verbose : Bool,
   on_token : (String) -> Unit,
   on_done : (String, Int, Int) -> Unit,
 ) -> Unit {
   let t0 = now_ms()
   let sd = @qwen3.StreamDecoder::new(self.tk)
-  decode_step(self, first, pos, max, [], sd, on_token, t0, verbose, fn(text, n) {
-    on_done(text, n, (now_ms() - t0).to_int())
-  })
+  decode_step(
+    self, first, pos, max, [], sd, on_token, sampler, t0, verbose,
+    fn(text, n) { on_done(text, n, (now_ms() - t0).to_int()) },
+  )
 }
 
 ///|
@@ -508,6 +609,7 @@ pub fn Runner::ask(
   self : Runner,
   user : String,
   max : Int,
+  sampler : Sampler,
   on_token : (String) -> Unit,
   on_done : (String, Int, Int, Int) -> Unit,
 ) -> Unit {
@@ -526,7 +628,7 @@ pub fn Runner::ask(
   self.readback_logits(fn(got) {
     let pms = (now_ms() - tp).to_int()
     let am = argmax(got)
-    self.decode_greedy(am, ids.length(), max, false, on_token, fn(text, n, dms) {
+    self.decode_greedy(am, ids.length(), max, sampler, false, on_token, fn(text, n, dms) {
       on_done(text, pms, dms, n)
     })
   })

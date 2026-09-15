@@ -47,6 +47,13 @@ extern "js" fn ui_answer_append(s : String) -> Unit =
   #|}
 
 ///|
+extern "js" fn ui_get_cfg(cb : (Int, Double, Int, Double) -> Unit) -> Unit =
+  #|(cb) => {
+  #|  const v = (id, d) => { const x = parseFloat(document.getElementById(id).value); return isNaN(x) ? d : x; };
+  #|  cb(Math.max(1, v('cfg_max', 256) | 0), v('cfg_temp', 0.0), Math.max(0, v('cfg_topk', 1) | 0), v('cfg_topp', 1.0));
+  #|}
+
+///|
 extern "js" fn ui_enable() -> Unit =
   #|() => {
   #|  document.getElementById('in').disabled = false;
@@ -84,11 +91,15 @@ fn main {
         ui_log(">>> " + text)
         ui_status("generating…")
         ui_answer_begin()
-        r.ask(text, 256, ui_answer_append, fn(_, pms, dms, n) {
-          busy.val = false
-          ui_status(
-            "prefill \{pms} ms · decode \{dms} ms · \{n} tok (\{if n > 0 { dms / n } else { 0 }} ms/tok)",
-          )
+        ui_get_cfg(fn(max, temp, top_k, top_p) {
+          let sampler = @qwenrun.Sampler::new(temp, top_k, top_p)
+          r.ask(text, max, sampler, ui_answer_append, fn(_, pms, dms, n) {
+            busy.val = false
+            let mode = if temp <= 0.0 { "greedy" } else { "temp=\{temp} top_k=\{top_k} top_p=\{top_p}" }
+            ui_status(
+              "prefill \{pms} ms · decode \{dms} ms · \{n} tok (\{if n > 0 { dms / n } else { 0 }} ms/tok) · \{mode}",
+            )
+          })
         })
       })
     })

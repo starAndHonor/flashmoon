@@ -106,16 +106,63 @@ fn gate(r : @qwenrun.Runner) -> Unit raise Error {
       return
     }
     // sample decode of the gate prompt, then drop into the REPL
-    r.decode_greedy(am, ids.length(), 16, true, fn(_) { () }, fn(text, n, ms) {
+    r.decode_greedy(am, ids.length(), 16, @qwenrun.Sampler::greedy(), true, fn(_) { () }, fn(text, n, ms) {
       post("[decode \{n} tok: \{ms} ms]")
       post("text: \"\{text}\"")
-      repl(r)
+      repl(r, { max: 256, sampler: @qwenrun.Sampler::greedy() })
     })
   })
 }
 
+///| REPL-tunable generation settings.
+struct Cfg {
+  mut max : Int
+  mut sampler : @qwenrun.Sampler
+}
+
 ///|
-fn repl(r : @qwenrun.Runner) -> Unit {
+fn show_cfg(cfg : Cfg) -> String {
+  let s = cfg.sampler
+  if s.temp() <= 0.0 {
+    "max=\{cfg.max} greedy"
+  } else {
+    "max=\{cfg.max} temp=\{s.temp()} top_k=\{s.top_k()} top_p=\{s.top_p()}"
+  }
+}
+
+///|
+/// Slash commands: /max N /temp F /topk K /topp F /greedy /help
+fn repl_cmd(cfg : Cfg, line : String) -> Unit {
+  let parts = line.split(" ").iter().map(fn(s) { s.to_string() }).collect()
+  let arg = if parts.length() > 1 { parts[1] } else { "" }
+  match parts[0] {
+    "/max" => cfg.max = @strconv.parse_int(arg) catch { _ => cfg.max }
+    "/temp" =>
+      cfg.sampler = @qwenrun.Sampler::new(
+        @strconv.parse_double(arg) catch { _ => cfg.sampler.temp() },
+        cfg.sampler.top_k(),
+        cfg.sampler.top_p(),
+      )
+    "/topk" =>
+      cfg.sampler = @qwenrun.Sampler::new(
+        cfg.sampler.temp(),
+        @strconv.parse_int(arg) catch { _ => cfg.sampler.top_k() },
+        cfg.sampler.top_p(),
+      )
+    "/topp" =>
+      cfg.sampler = @qwenrun.Sampler::new(
+        cfg.sampler.temp(),
+        cfg.sampler.top_k(),
+        @strconv.parse_double(arg) catch { _ => cfg.sampler.top_p() },
+      )
+    "/greedy" => cfg.sampler = @qwenrun.Sampler::greedy()
+    _ => post("commands: /max N /temp F /topk K /topp F /greedy")
+  }
+  post("[\{show_cfg(cfg)}]")
+}
+
+///|
+fn repl(r : @qwenrun.Runner, cfg : Cfg) -> Unit {
   print_raw("\n>>> ")
   read_line(fn(line) {
     if line == "quit" || line == "exit" {
@@ -123,15 +170,18 @@ fn repl(r : @qwenrun.Runner) -> Unit {
       return
     }
     if line.trim() == "" {
-      repl(r)
+      repl(r, cfg)
       return
     }
-    let t0 = now_ms()
-    r.ask(line, 256, print_raw, fn(_, pms, dms, n) {
-      ignore(t0)
+    if line.has_prefix("/") {
+      repl_cmd(cfg, line)
+      repl(r, cfg)
+      return
+    }
+    r.ask(line, cfg.max, cfg.sampler, print_raw, fn(_, pms, dms, n) {
       post("")
-      post("[\{pms}ms prefill / \{dms}ms decode, \{n} tok]")
-      repl(r)
+      post("[\{pms}ms prefill / \{dms}ms decode, \{n} tok · \{show_cfg(cfg)}]")
+      repl(r, cfg)
     })
   }, fn() { post("bye") })
 }

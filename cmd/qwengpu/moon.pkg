@@ -4,6 +4,7 @@ import {
   "starAndHonor/flashmoon/qwen" @qwen3,
   "moonbitlang/core/math",
   "moonbitlang/core/json",
+  "moonbitlang/core/strconv",
 }
 
 pkgtype(kind: "executable")

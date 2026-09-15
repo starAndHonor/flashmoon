@@ -8,6 +8,8 @@
   #status { color: #666; margin: .5rem 0; font-family: ui-monospace, monospace; font-size: 12px; }
   #log { white-space: pre-wrap; border: 1px solid #ccc; border-radius: 6px; padding: 1rem; height: 60vh; overflow-y: auto; }
   #log div { margin: .25rem 0; }
+  #cfg { display: flex; gap: .75rem; align-items: center; margin-top: .5rem; font-size: 12px; color: #555; }
+  #cfg input { width: 4.5rem; padding: .2rem; }
   #bar { display: flex; gap: .5rem; margin-top: .75rem; }
   #in { flex: 1; padding: .5rem; }
 </style>
@@ -17,5 +19,12 @@
 <div id="bar">
   <input id="in" disabled placeholder="Ask something… (Enter to send)">
   <button id="send" disabled>Send</button>
+</div>
+<div id="cfg">
+  max <input id="cfg_max" type="number" value="256" min="1" max="1800">
+  temp <input id="cfg_temp" type="number" value="0" step="0.1" min="0" max="2">
+  top-k <input id="cfg_topk" type="number" value="1" min="0" max="100">
+  top-p <input id="cfg_topp" type="number" value="1" step="0.05" min="0" max="1">
+  <span style="color:#888">temp 0 = greedy</span>
 </div>
 <script src="../../_build/js/debug/build/cmd/webchat/webchat.js"></script>
