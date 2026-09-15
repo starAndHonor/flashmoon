@@ -133,27 +133,27 @@ fn show_cfg(cfg : Cfg) -> String {
 ///|
 /// Slash commands: /max N /temp F /topk K /topp F /greedy /help
 fn repl_cmd(cfg : Cfg, line : String) -> Unit {
-  let parts = line.split(" ").iter().map(fn(s) { s.to_string() }).collect()
+  let parts = line.split(" ").iter().map(fn(s) { s.to_owned() }).collect()
   let arg = if parts.length() > 1 { parts[1] } else { "" }
   match parts[0] {
-    "/max" => cfg.max = @strconv.parse_int(arg) catch { _ => cfg.max }
+    "/max" => cfg.max = @string.parse_int(arg) catch { _ => cfg.max }
     "/temp" =>
       cfg.sampler = @qwenrun.Sampler::new(
-        @strconv.parse_double(arg) catch { _ => cfg.sampler.temp() },
+        @string.parse_double(arg) catch { _ => cfg.sampler.temp() },
         cfg.sampler.top_k(),
         cfg.sampler.top_p(),
       )
     "/topk" =>
       cfg.sampler = @qwenrun.Sampler::new(
         cfg.sampler.temp(),
-        @strconv.parse_int(arg) catch { _ => cfg.sampler.top_k() },
+        @string.parse_int(arg) catch { _ => cfg.sampler.top_k() },
         cfg.sampler.top_p(),
       )
     "/topp" =>
       cfg.sampler = @qwenrun.Sampler::new(
         cfg.sampler.temp(),
         cfg.sampler.top_k(),
-        @strconv.parse_double(arg) catch { _ => cfg.sampler.top_p() },
+        @string.parse_double(arg) catch { _ => cfg.sampler.top_p() },
       )
     "/greedy" => cfg.sampler = @qwenrun.Sampler::greedy()
     _ => post("commands: /max N /temp F /topk K /topp F /greedy")
