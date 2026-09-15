@@ -430,20 +430,30 @@ fn run(g : @gpu.Gpu) -> Unit raise Error {
   g.set_u32(pos0b, 0)
   g.sync(fn(_) { () })
   post("weights uploaded: \{(now_ms() - t0).to_int()} ms")
-  // prompt
-  let input_json = @json.parse(
+  // prompt: tokenize with our own BPE; assert it reproduces the HF ids
+  let tk = @qwen3.Tokenizer::load(
+    bytes_to_string(deno_read("refs/qwen3-0.6b/tokenizer.json")),
+  )
+  let prompt = "The capital of France is"
+  let ids = tk.encode(prompt)
+  let ref_ids_json = @json.parse(
     bytes_to_string(deno_read("refs/qwen3-0.6b/ref_input.json")),
   )
-  guard input_json is Array(ids_json) else {
+  guard ref_ids_json is Array(ref_ids) else {
     raise Failure("ref_input.json: expected array")
   }
-  let ids : Array[Int] = []
-  for id in ids_json {
-    guard id is Number(v, ..) else {
+  if ref_ids.length() != ids.length() {
+    raise Failure("tokenizer diverges from ref_input.json (length)")
+  }
+  for i in 0..<ids.length() {
+    guard ref_ids[i] is Number(rv, ..) else {
       raise Failure("ref_input.json: not number")
     }
-    ids.push(v.to_int())
+    if rv.to_int() != ids[i] {
+      raise Failure("tokenizer diverges from ref_input.json at \{i}")
+    }
   }
+  post("prompt: \{ids.length()} tokens (self-tokenized, matches HF ids)")
   let s = ids.length()
   let logits = g.alloc(VOCAB)
   // prefill: one batched encoder for embeds + 28 layers + lm_head
@@ -488,8 +498,8 @@ fn run(g : @gpu.Gpu) -> Unit raise Error {
     let am_i = g.alloc(594)
     let am_o = g.alloc(1)
     decode_step(
-      g, model, dact, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, am,
-      s, 8, [], now_ms(),
+      g, model, dact, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, tk,
+      am, s, 32, [], now_ms(),
     )
   })
 }
@@ -508,20 +518,25 @@ fn decode_step(
   am_v : @gpu.GPUBuffer,
   am_i : @gpu.GPUBuffer,
   am_o : @gpu.GPUBuffer,
-  tok : Int,
+  tk : @qwen3.Tokenizer,
+  cur : Int,
   pos : Int,
   remaining : Int,
   out : Array[Int],
   t0 : Double,
 ) -> Unit {
-  if remaining == 0 {
+  if remaining == 0 || (cur == 151643 || cur == 151645) {
     let dt = now_ms() - t0
-    post("decode \{out.length()} tokens: \{dt.to_int()} ms, ids=\{out}")
+    post(
+      "decode \{out.length()} tokens: \{dt.to_int()} ms (\{(dt / out.length().to_double()).to_int()} ms/tok)",
+    )
+    let text = tk.decode(out) catch { _ => "<decode error>" }
+    post("text: \"\{text}\"")
     post("done")
     return
   }
   let ts = now_ms()
-  g.set_u32(tok_buf, tok)
+  g.set_u32(tok_buf, cur)
   g.set_u32(pos0b, pos)
   g.begin()
   g.embed_rows(model.w["embed"], tok_buf, act.x, 1, HID)
@@ -537,8 +552,8 @@ fn decode_step(
     post("step pos=\{pos}: encode=\{(te - ts).to_int()}ms total=\{(now_ms() - ts).to_int()}ms")
     out.push(am)
     decode_step(
-      g, model, act, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, am,
-      pos + 1, remaining - 1, out, t0,
+      g, model, act, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, tk,
+      am, pos + 1, remaining - 1, out, t0,
     )
   })
 }
