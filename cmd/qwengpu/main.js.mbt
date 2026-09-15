@@ -89,25 +89,38 @@ fn upload(
 }
 
 ///|
+/// Matrix weight upload: BF16 payload uploaded verbatim (no conversion —
+/// kernels unpack bf16 to the exact same f32 values as the CPU oracle).
+fn upload_w(
+  g : @gpu.Gpu,
+  st : @qwen3.SafeTensors,
+  name : String,
+) -> @gpu.GPUBuffer raise Error {
+  let (bytes, off, n, dtype) = st.raw(name)
+  guard dtype == "BF16" else { raise Failure("\{name}: expected BF16") }
+  g.upload_raw(bytes, off, n * 2)
+}
+
+///|
 fn load_model(g : @gpu.Gpu, st : @qwen3.SafeTensors) -> Model raise Error {
   let w : Map[String, @gpu.GPUBuffer] = Map([])
-  w["embed"] = upload(g, st, "model.embed_tokens.weight")
+  w["embed"] = upload_w(g, st, "model.embed_tokens.weight")
   w["norm"] = upload(g, st, "model.norm.weight")
   let kc : Array[@gpu.GPUBuffer] = []
   let vc : Array[@gpu.GPUBuffer] = []
   for i in 0..<NL {
     let p = "model.layers.\{i}"
-    w["q\{i}"] = upload(g, st, "\{p}.self_attn.q_proj.weight")
-    w["k\{i}"] = upload(g, st, "\{p}.self_attn.k_proj.weight")
-    w["v\{i}"] = upload(g, st, "\{p}.self_attn.v_proj.weight")
-    w["o\{i}"] = upload(g, st, "\{p}.self_attn.o_proj.weight")
+    w["q\{i}"] = upload_w(g, st, "\{p}.self_attn.q_proj.weight")
+    w["k\{i}"] = upload_w(g, st, "\{p}.self_attn.k_proj.weight")
+    w["v\{i}"] = upload_w(g, st, "\{p}.self_attn.v_proj.weight")
+    w["o\{i}"] = upload_w(g, st, "\{p}.self_attn.o_proj.weight")
     w["qn\{i}"] = upload(g, st, "\{p}.self_attn.q_norm.weight")
     w["kn\{i}"] = upload(g, st, "\{p}.self_attn.k_norm.weight")
     w["in\{i}"] = upload(g, st, "\{p}.input_layernorm.weight")
     w["pn\{i}"] = upload(g, st, "\{p}.post_attention_layernorm.weight")
-    w["gate\{i}"] = upload(g, st, "\{p}.mlp.gate_proj.weight")
-    w["up\{i}"] = upload(g, st, "\{p}.mlp.up_proj.weight")
-    w["down\{i}"] = upload(g, st, "\{p}.mlp.down_proj.weight")
+    w["gate\{i}"] = upload_w(g, st, "\{p}.mlp.gate_proj.weight")
+    w["up\{i}"] = upload_w(g, st, "\{p}.mlp.up_proj.weight")
+    w["down\{i}"] = upload_w(g, st, "\{p}.mlp.down_proj.weight")
     kc.push(g.alloc(MAXPOS * NKH * HD))
     vc.push(g.alloc(MAXPOS * NKH * HD))
   }
@@ -433,12 +446,12 @@ fn run(g : @gpu.Gpu) -> Unit raise Error {
   }
   let s = ids.length()
   let logits = g.alloc(VOCAB)
-  // prefill
+  // prefill: one batched encoder for embeds + 28 layers + lm_head
   let act = alloc_act(g, s)
-  for t in 0..<s {
-    g.copy(model.w["embed"], ids[t] * HID, act.x, t * HID, HID)
-  }
   let tp = now_ms()
+  g.begin()
+  let ids_buf = g.upload_u32(ids)
+  g.embed_rows(model.w["embed"], ids_buf, act.x, s, HID)
   for li in 0..<NL {
     layer(g, model, li, act, 0, pos0b, cost, sint)
   }
@@ -447,6 +460,7 @@ fn run(g : @gpu.Gpu) -> Unit raise Error {
   g.copy(act.x, (s - 1) * HID, xl, 0, HID)
   g.rmsnorm(xl, model.w["norm"], xl, 1, HID, EPS)
   g.matvec(model.w["embed"], xl, logits, VOCAB, HID)
+  g.flush()
   g.readback(logits, VOCAB, fn(got) {
     post("prefill \{s} tokens: \{(now_ms() - tp).to_int()} ms")
     // compare with HF reference logits
@@ -468,8 +482,14 @@ fn run(g : @gpu.Gpu) -> Unit raise Error {
     }
     // greedy decode a few tokens
     let dact = alloc_act(g, 1)
+    let tok_buf = g.alloc_u32()
+    // argmax scratch: 594 workgroup partials + 1-float output
+    let am_v = g.alloc(594)
+    let am_i = g.alloc(594)
+    let am_o = g.alloc(1)
     decode_step(
-      g, model, dact, cost, sint, pos0b, logits, am, s, 8, [], now_ms(),
+      g, model, dact, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, am,
+      s, 8, [], now_ms(),
     )
   })
 }
@@ -483,7 +503,11 @@ fn decode_step(
   cost : @gpu.GPUBuffer,
   sint : @gpu.GPUBuffer,
   pos0b : @gpu.GPUBuffer,
+  tok_buf : @gpu.GPUBuffer,
   logits : @gpu.GPUBuffer,
+  am_v : @gpu.GPUBuffer,
+  am_i : @gpu.GPUBuffer,
+  am_o : @gpu.GPUBuffer,
   tok : Int,
   pos : Int,
   remaining : Int,
@@ -496,19 +520,25 @@ fn decode_step(
     post("done")
     return
   }
+  let ts = now_ms()
+  g.set_u32(tok_buf, tok)
   g.set_u32(pos0b, pos)
-  g.copy(model.w["embed"], tok * HID, act.x, 0, HID)
+  g.begin()
+  g.embed_rows(model.w["embed"], tok_buf, act.x, 1, HID)
+  g.rmsnorm(act.x, model.w["in0"], act.xn, 1, HID, EPS)
   for li in 0..<NL {
-    layer(g, model, li, act, pos, pos0b, cost, sint)
+    decode_layer(g, model, li, act, pos0b, cost, sint)
   }
-  g.rmsnorm(act.x, model.w["norm"], act.x, 1, HID, EPS)
-  g.matvec(model.w["embed"], act.x, logits, VOCAB, HID)
-  g.readback(logits, VOCAB, fn(got) {
-    let am = argmax(got)
+  // act.xn already carries the final norm (last layer's add_rmsnorm)
+  g.matvec(model.w["embed"], act.xn, logits, VOCAB, HID)
+  g.flush()
+  let te = now_ms()
+  g.argmax(logits, VOCAB, am_v, am_i, am_o, fn(am) {
+    post("step pos=\{pos}: encode=\{(te - ts).to_int()}ms total=\{(now_ms() - ts).to_int()}ms")
     out.push(am)
     decode_step(
-      g, model, act, cost, sint, pos0b, logits, am, pos + 1, remaining - 1, out,
-      t0,
+      g, model, act, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, am,
+      pos + 1, remaining - 1, out, t0,
     )
   })
 }
@@ -522,4 +552,56 @@ fn main {
       }
     })
   }, log=post)
+}
+
+///|
+/// Fused decode layer (rows=1): 9 dispatches instead of 19 —
+/// qkv+v→cache, qknorm+rope+k→cache, attention, o, add+rmsnorm,
+/// gate+up, silu, down, add+rmsnorm(next layer's input norm; the last
+/// layer uses the final norm so lm_head reads xn directly).
+fn decode_layer(
+  g : @gpu.Gpu,
+  m : Model,
+  li : Int,
+  x : GPUAct,
+  pos0 : @gpu.GPUBuffer,
+  cost : @gpu.GPUBuffer,
+  sint : @gpu.GPUBuffer,
+) -> Unit {
+  let nq = NQH * HD
+  let nkv = NKH * HD
+  g.qkv_fused(
+    x.xn,
+    m.w["q\{li}"],
+    m.w["k\{li}"],
+    m.w["v\{li}"],
+    x.qq,
+    x.kk,
+    m.vc[li],
+    pos0,
+    nq,
+    nkv,
+    HID,
+  )
+  g.qknorm_rope(
+    x.qq,
+    x.kk,
+    m.w["qn\{li}"],
+    m.w["kn\{li}"],
+    m.kc[li],
+    cost,
+    sint,
+    pos0,
+    NQH,
+    NKH,
+    HD,
+    EPS,
+  )
+  g.attn_rows(x.qq, m.kc[li], m.vc[li], x.attn, pos0, 1, NQH, NKH, HD, MAXPOS)
+  g.matvec(m.w["o\{li}"], x.attn, x.proj, HID, nq)
+  g.add_rmsnorm(x.x, x.proj, m.w["pn\{li}"], x.xn, 1, HID, EPS)
+  g.gemv2_fused(x.xn, m.w["gate\{li}"], m.w["up\{li}"], x.gb, x.ub, INTER, HID)
+  g.matvec_silu(m.w["down\{li}"], x.gb, x.ub, x.mlpb, HID, INTER)
+  let next_norm = if li + 1 < NL { m.w["in\{li + 1}"] } else { m.w["norm"] }
+  g.add_rmsnorm(x.x, x.mlpb, next_norm, x.xn, 1, HID, EPS)
 }

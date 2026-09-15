@@ -45,6 +45,13 @@ fn max_diff(a : FixedArray[Float], b : FixedArray[Float]) -> Float {
 }
 
 ///|
+/// bf16 truncation, matching the GPU kernels' exact upcast: keeps the
+/// CPU oracle lossless against bf16 weight buffers.
+fn bf16r(x : Float) -> Float {
+  Float::reinterpret_from_int(x.reinterpret_as_int() & -65536)
+}
+
+///|
 /// CPU reference: y[out] = W[out,in] @ x[in]
 fn cpu_matvec(w : FixedArray[Float], x : FixedArray[Float], out : Int, inn : Int) -> FixedArray[Float] {
   let y = FixedArray::make(out, 0.0F)
@@ -122,9 +129,9 @@ fn check_attention(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
 ///|
 fn check_gemv(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
   // Correctness: 512 x 256
-  let w = make_mat(512, 256, 3)
+  let w = make_mat(512, 256, 3).map(bf16r)
   let x = make_mat(256, 1, 4)
-  let wb = g.upload(w)
+  let wb = g.upload_raw_buf(@gpu.to_bf16(w))
   let xb = g.upload(x)
   let yb = g.alloc(512)
   g.matvec(wb, xb, yb, 512, 256)
@@ -133,7 +140,7 @@ fn check_gemv(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
     // Perf: lm_head decode shape 151936 x 1024. Weights GPU-allocated
     // garbage: 155M floats exceed V8's max JS-array length (2^27), and
     // values don't affect kernel speed.
-    let wb2 = g.alloc(151936 * 1024)
+    let wb2 = g.alloc(151936 * 1024 / 2)
     let x2 = make_mat(1024, 1, 6)
     let xb2 = g.upload(x2)
     let yb2 = g.alloc(151936)
@@ -145,7 +152,7 @@ fn check_gemv(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
       }
       g.sync(fn(_) {
         let dt = (now_ms() - t0) / 10.0
-        let gb = 151936.0 * 1024.0 * 4.0 / 1.0e9
+        let gb = 151936.0 * 1024.0 * 2.0 / 1.0e9
         post(
           "gemv 151936x1024: \{dt} ms, \{gb / (dt / 1000.0)} GB/s (dispatch only)",
         )
@@ -159,18 +166,18 @@ fn check_gemv(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
 fn check_gemm(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
   // Correctness: s=32, out=256, in=512
   let x = make_mat(32, 512, 7)
-  let w = make_mat(256, 512, 8)
+  let w = make_mat(256, 512, 8).map(bf16r)
   let xb = g.upload(x)
-  let wb = g.upload(w)
+  let wb = g.upload_raw_buf(@gpu.to_bf16(w))
   let yb = g.alloc(32 * 256)
   g.matmul(xb, wb, yb, 32, 256, 512)
   g.readback(yb, 32 * 256, fn(got) {
     post("gemm 32x256x512: max_diff=\{max_diff(got, cpu_matmul(x, w, 32, 256, 512))}")
     // Perf: prefill shape s=128, q_proj 2048x1024
     let x2 = make_mat(128, 1024, 9)
-    let w2 = make_mat(2048, 1024, 10)
+    let w2 = make_mat(2048, 1024, 10).map(bf16r)
     let xb2 = g.upload(x2)
-    let wb2 = g.upload(w2)
+    let wb2 = g.upload_raw_buf(@gpu.to_bf16(w2))
     let yb2 = g.alloc(128 * 2048)
     g.matmul(xb2, wb2, yb2, 128, 2048, 1024) // warm
     g.sync(fn(_) {

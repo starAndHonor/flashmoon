@@ -23,6 +23,9 @@ pub struct Gpu {
   device : GPUDevice
   queue : GPUQueue
   pipelines : Map[String, GPUComputePipeline]
+  /// Some((enc, pass)) while batching: ops append to ONE open compute
+  /// pass until Gpu::flush (per-pass overhead >> per-dispatch on Dawn).
+  batch : Ref[(GPUCommandEncoder, GPUComputePassEncoder)?]
 }
 
 ///|
@@ -37,7 +40,7 @@ pub fn Gpu::init(
         "device maxComputeWorkgroupStorageSize=\{device.max_workgroup_storage()}",
       )
     device.on_uncaptured_error(fn(msg) { log("GPU ERROR: \{msg}") })
-      cb({ device, queue: device.get_queue(), pipelines: Map([]) })
+      cb({ device, queue: device.get_queue(), pipelines: Map([]), batch: { val: None } })
     })
   })
 }
@@ -87,8 +90,30 @@ fn Gpu::pipeline(
 }
 
 ///|
-/// Encode + submit one compute pass for `pipeline` with `bufs` bound at
-/// 0..n, dispatching (gx, gy, 1) workgroups.
+/// Begin batching: subsequent compute ops append to ONE open compute pass
+/// until Gpu::flush submits the encoder. A decode token is ~250 ops; on
+/// Dawn, per-pass overhead dominates per-dispatch, so all ops share a pass.
+pub fn Gpu::begin(self : Gpu) -> Unit {
+  let enc = self.device.create_command_encoder()
+  self.batch.val = Some((enc, enc.begin_compute_pass()))
+}
+
+///|
+/// Submit the batched pass+encoder; no-op outside a batch.
+pub fn Gpu::flush(self : Gpu) -> Unit {
+  match self.batch.val {
+    Some((enc, pass)) => {
+      pass.end()
+      self.queue.submit([enc.finish()])
+      self.batch.val = None
+    }
+    None => ()
+  }
+}
+
+///|
+/// Encode one dispatch of `pipeline` with `bufs` bound at 0..n. Batched:
+/// appends to the open batch pass; otherwise one-shot pass + submit.
 fn Gpu::run_pass(
   self : Gpu,
   pipeline : GPUComputePipeline,
@@ -97,13 +122,22 @@ fn Gpu::run_pass(
   gy : Int,
 ) -> Unit {
   let bg = self.device.make_bind_group(pipeline, bufs)
-  let enc = self.device.create_command_encoder()
-  let pass = enc.begin_compute_pass()
-  pass.set_pipeline(pipeline)
-  pass.set_bind_group(0, bg)
-  pass.dispatch_workgroups(gx, gy, 1)
-  pass.end()
-  self.queue.submit([enc.finish()])
+  match self.batch.val {
+    Some((_, pass)) => {
+      pass.set_pipeline(pipeline)
+      pass.set_bind_group(0, bg)
+      pass.dispatch_workgroups(gx, gy, 1)
+    }
+    None => {
+      let enc = self.device.create_command_encoder()
+      let pass = enc.begin_compute_pass()
+      pass.set_pipeline(pipeline)
+      pass.set_bind_group(0, bg)
+      pass.dispatch_workgroups(gx, gy, 1)
+      pass.end()
+      self.queue.submit([enc.finish()])
+    }
+  }
 }
 
 ///|
@@ -150,7 +184,7 @@ pub fn Gpu::matvec(
     abort("matvec: in must be a multiple of 4 and <= 3072, got \{inn}")
   }
   let p = self.pipeline("gemv:\{out}x\{inn}", fn() { gemv_shader(out, inn) })
-  self.run_pass(p, [w, x, y], (out + 7) / 8, 1)
+  self.run_pass(p, [w, x, y], (out + 15) / 16, 1)
 }
 
 ///|
@@ -274,21 +308,8 @@ pub fn Gpu::set_u32(self : Gpu, buf : GPUBuffer, v : Int) -> Unit {
 }
 
 ///|
-/// Embedding row gather: dst[0..n] = emb[token*n .. token*n + n].
-pub fn Gpu::embed(
-  self : Gpu,
-  emb : GPUBuffer,
-  dst : GPUBuffer,
-  token : Int,
-  n : Int,
-) -> Unit {
-  let enc = self.device.create_command_encoder()
-  enc.copy_buffer_to_buffer(emb, token * n * 4, dst, 0, n * 4)
-  self.queue.submit([enc.finish()])
-}
-
-///|
-/// Block copy of `n` floats between storage buffers.
+/// Block copy of `n` floats between storage buffers. Batched: the open
+/// compute pass is closed, the copy recorded, and a fresh pass reopened.
 pub fn Gpu::copy(
   self : Gpu,
   src : GPUBuffer,
@@ -297,9 +318,18 @@ pub fn Gpu::copy(
   dst_off : Int,
   n : Int,
 ) -> Unit {
-  let enc = self.device.create_command_encoder()
-  enc.copy_buffer_to_buffer(src, src_off * 4, dst, dst_off * 4, n * 4)
-  self.queue.submit([enc.finish()])
+  match self.batch.val {
+    Some((enc, pass)) => {
+      pass.end()
+      enc.copy_buffer_to_buffer(src, src_off * 4, dst, dst_off * 4, n * 4)
+      self.batch.val = Some((enc, enc.begin_compute_pass()))
+    }
+    None => {
+      let enc = self.device.create_command_encoder()
+      enc.copy_buffer_to_buffer(src, src_off * 4, dst, dst_off * 4, n * 4)
+      self.queue.submit([enc.finish()])
+    }
+  }
 }
 
 ///|
@@ -392,4 +422,203 @@ pub fn Gpu::attn_rows(
     attn_rows_shader(hq, hkv, hd, max_pos, scale)
   })
   self.run_pass(p, [q, kc, vc, out, pos0], hq, rows)
+}
+
+///|
+/// Upload raw bytes (e.g. a BF16 safetensors payload, zero conversion).
+pub fn Gpu::upload_raw(
+  self : Gpu,
+  data : Bytes,
+  off : Int,
+  byte_len : Int,
+) -> GPUBuffer {
+  let buf = self.device.create_buffer(
+    byte_len,
+    USAGE_STORAGE | USAGE_COPY_SRC | USAGE_COPY_DST,
+    mapped_at_creation=false,
+  )
+  self.queue.write_buffer_raw(buf, bytes_view(data, off, byte_len))
+  buf
+}
+
+///|
+/// Upload a raw typed array (e.g. host-converted bf16 test data).
+pub fn Gpu::upload_raw_buf(self : Gpu, data : RawBuf) -> GPUBuffer {
+  let buf = self.device.create_buffer(
+    data.byte_len(),
+    USAGE_STORAGE | USAGE_COPY_SRC | USAGE_COPY_DST,
+    mapped_at_creation=false,
+  )
+  self.queue.write_buffer_raw(buf, data)
+  buf
+}
+
+///|
+/// Allocate an `n`-entry u32 buffer and fill it (token ids).
+pub fn Gpu::upload_u32(self : Gpu, data : Array[Int]) -> GPUBuffer {
+  let buf = self.device.create_buffer(
+    data.length() * 4,
+    USAGE_STORAGE | USAGE_COPY_DST,
+    mapped_at_creation=false,
+  )
+  self.queue.write_u32_array(buf, data)
+  buf
+}
+
+///|
+/// Embedding gather, bf16 weights: dst[row, :] = emb[ids[row], :] for
+/// rows token rows of length n.
+pub fn Gpu::embed_rows(
+  self : Gpu,
+  emb : GPUBuffer,
+  ids : GPUBuffer,
+  dst : GPUBuffer,
+  rows : Int,
+  n : Int,
+) -> Unit {
+  if n % 2 != 0 {
+    abort("embed_rows: n must be even, got \{n}")
+  }
+  let p = self.pipeline("embed:\{rows},\{n}", fn() { embed_rows_shader(rows, n) })
+  self.run_pass(p, [emb, ids, dst], (rows * (n / 2) + 255) / 256, 1)
+}
+
+///|
+/// Fused QKV projection (decode): qout = Wq x, kout = Wk x, and
+/// vc[params[0]] = Wv x (v written straight into the KV cache).
+pub fn Gpu::qkv_fused(
+  self : Gpu,
+  x : GPUBuffer,
+  wq : GPUBuffer,
+  wk : GPUBuffer,
+  wv : GPUBuffer,
+  qout : GPUBuffer,
+  kout : GPUBuffer,
+  vc : GPUBuffer,
+  params : GPUBuffer,
+  nq : Int,
+  nkv : Int,
+  inn : Int,
+) -> Unit {
+  let p = self.pipeline("qkv:\{nq},\{nkv},\{inn}", fn() {
+    qkv_fused_shader(nq, nkv, inn)
+  })
+  self.run_pass(
+    p,
+    [x, wq, wk, wv, qout, kout, vc, params],
+    (nq + 2 * nkv + 7) / 8,
+    1,
+  )
+}
+
+///|
+/// Fused gate+up projection (decode): gout = Wg x, uout = Wu x.
+pub fn Gpu::gemv2_fused(
+  self : Gpu,
+  x : GPUBuffer,
+  wg : GPUBuffer,
+  wu : GPUBuffer,
+  gout : GPUBuffer,
+  uout : GPUBuffer,
+  n : Int,
+  inn : Int,
+) -> Unit {
+  let p = self.pipeline("gemv2:\{n},\{inn}", fn() { gemv2_fused_shader(n, inn) })
+  self.run_pass(p, [x, wg, wu, gout, uout], (2 * n + 7) / 8, 1)
+}
+
+///|
+/// Fused per-head RMSNorm + NeoX RoPE for q (in place) and k (written
+/// into the KV cache at params[0]). Decode only (one token row).
+pub fn Gpu::qknorm_rope(
+  self : Gpu,
+  q : GPUBuffer,
+  k : GPUBuffer,
+  qnw : GPUBuffer,
+  knw : GPUBuffer,
+  kc : GPUBuffer,
+  cost : GPUBuffer,
+  sint : GPUBuffer,
+  params : GPUBuffer,
+  hq : Int,
+  hkv : Int,
+  hd : Int,
+  eps : Float,
+) -> Unit {
+  if hd != 128 {
+    abort("qknorm_rope: only hd=128, got \{hd}")
+  }
+  let p = self.pipeline("qknr:\{hq},\{hkv},\{hd}", fn() {
+    qknorm_rope_shader(hq, hkv, hd, eps)
+  })
+  self.run_pass(p, [q, k, qnw, knw, kc, cost, sint, params], hq + hkv, 1)
+}
+
+///|
+/// Fused residual add + RMSNorm: x[r] += d[r]; y[r] = rmsnorm(x[r]) * w.
+pub fn Gpu::add_rmsnorm(
+  self : Gpu,
+  x : GPUBuffer,
+  d : GPUBuffer,
+  w : GPUBuffer,
+  y : GPUBuffer,
+  rows : Int,
+  n : Int,
+  eps : Float,
+) -> Unit {
+  if n % 4 != 0 {
+    abort("add_rmsnorm: n must be a multiple of 4, got \{n}")
+  }
+  let p = self.pipeline("arms:\{n}:\{eps}", fn() { add_rmsnorm_shader(n, eps) })
+  self.run_pass(p, [x, d, w, y], rows, 1)
+}
+
+///|
+/// Down-projection GEMV with fused silu(g)*u activation on staging.
+pub fn Gpu::matvec_silu(
+  self : Gpu,
+  w : GPUBuffer,
+  g : GPUBuffer,
+  u : GPUBuffer,
+  y : GPUBuffer,
+  out : Int,
+  inn : Int,
+) -> Unit {
+  let p = self.pipeline("gemvs:\{out}x\{inn}", fn() { gemv_silu_shader(out, inn) })
+  self.run_pass(p, [w, g, u, y], (out + 7) / 8, 1)
+}
+
+///|
+/// GPU argmax over n logits; cb receives the winning index. Two-phase
+/// shared-memory reduction; readback is 4 bytes instead of the full
+/// logits vector (~6ms/map saved per decode token).
+pub fn Gpu::argmax(
+  self : Gpu,
+  x : GPUBuffer,
+  n : Int,
+  part_v : GPUBuffer,
+  part_i : GPUBuffer,
+  outb : GPUBuffer,
+  cb : (Int) -> Unit,
+) -> Unit {
+  let chunk = 256
+  let wgs = (n + chunk - 1) / chunk
+  let p1 = self.pipeline("am1:\{n}", fn() { argmax1_shader(n, chunk) })
+  self.run_pass(p1, [x, part_v, part_i], wgs, 1)
+  let p2 = self.pipeline("am2:\{wgs}", fn() { argmax2_shader(wgs) })
+  self.run_pass(p2, [part_v, part_i, outb], 1, 1)
+  // 4-byte readback
+  let readb = self.device.create_buffer(
+    4,
+    USAGE_MAP_READ | USAGE_COPY_DST,
+    mapped_at_creation=false,
+  )
+  let enc = self.device.create_command_encoder()
+  enc.copy_buffer_to_buffer(outb, 0, readb, 0, 4)
+  self.queue.submit([enc.finish()])
+  readb.map_async(MAP_MODE_READ, fn(_) {
+    let r = readb.get_float_array()
+    readb.unmap()
+    cb(r[0].to_int())
+  })
 }

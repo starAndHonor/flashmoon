@@ -285,42 +285,49 @@ pub fn combine_shader(n : Int, dv : Int, splits : Int) -> String {
 }
 
 ///|
-/// GEMV kernel: y[out] = W[out, in] @ x[in], W row-major.
+/// GEMV kernel, bf16 weights: y[out] = W[out, in] @ x[in], W row-major
+/// bf16 pairs packed as u32 (exact upcast in-kernel: u<<16 / u&0xffff0000).
 ///
 /// 256-thread workgroup covers 8 output rows (one 32-lane warp per row):
-/// x staged in shared as vec4 (<= 12KB for in <= 3072), lanes stream their
-/// row with coalesced 512B-per-instruction vec4 reads, then a per-warp
-/// shared reduction (8 rows reduced in parallel). Grid:
-/// (ceil(out/8), 1). Requires in % 4 == 0.
+/// x staged in shared as f32 (<= 12KB for in <= 3072), lanes stream W rows
+/// as coalesced u32 reads, then a per-warp shared reduction.
+/// Grid: (ceil(out/8), 1). Requires in % 2 == 0.
 pub fn gemv_shader(out : Int, inn : Int) -> String {
-  let in4 = inn / 4
+  let in8 = inn / 8
   let src =
-    $|@group(0) @binding(0) var<storage, read> w : array<vec4<f32>>;
+    $|@group(0) @binding(0) var<storage, read> w : array<vec4<u32>>;
     $|@group(0) @binding(1) var<storage, read> x : array<vec4<f32>>;
     $|@group(0) @binding(2) var<storage, read_write> y : array<f32>;
     $|
     $|const OUT : u32 = \{out}u;
-    $|const IN4 : u32 = \{in4}u;
+    $|const IN8 : u32 = \{in8}u;
     $|
-    $|var<workgroup> xs : array<vec4<f32>, 768>;
-    $|var<workgroup> part : array<f32, 256>;
+    $|var<workgroup> part : array<f32, 512>;
     $|
-    $|@compute @workgroup_size(256)
+    $|@compute @workgroup_size(512)
     $|fn main(
     $|  @builtin(workgroup_id) wid : vec3<u32>,
     $|  @builtin(local_invocation_id) lid : vec3<u32>,
     $|) {
-    $|  let rg = lid.x / 32u; // row group (warp) 0..7
+    $|  let rg = lid.x / 32u; // row group (warp) 0..15
     $|  let lane = lid.x % 32u;
-    $|  let o = wid.x * 8u + rg;
+    $|  let o = wid.x * 16u + rg;
     $|  let oo = min(o, OUT - 1u);
-    $|  for (var t = lid.x; t < IN4; t = t + 256u) {
-    $|    xs[t] = x[t];
-    $|  }
-    $|  workgroupBarrier();
     $|  var acc = 0.0;
-    $|  for (var t = lane; t < IN4; t = t + 32u) {
-    $|    acc = acc + dot(w[oo * IN4 + t], xs[t]);
+    $|  // x is 4KB and read by every workgroup: L1-resident; skip the
+    $|  // shared staging + barrier and read it straight from global.
+    $|  for (var t = lane; t < IN8; t = t + 32u) {
+    $|    let u4 = w[oo * IN8 + t]; // 8 bf16
+    $|    let x0 = x[t * 2u];
+    $|    let x1 = x[t * 2u + 1u];
+    $|    acc = acc + bitcast<f32>(u4.x << 16u) * x0.x
+    $|      + bitcast<f32>(u4.x & 0xffff0000u) * x0.y
+    $|      + bitcast<f32>(u4.y << 16u) * x0.z
+    $|      + bitcast<f32>(u4.y & 0xffff0000u) * x0.w
+    $|      + bitcast<f32>(u4.z << 16u) * x1.x
+    $|      + bitcast<f32>(u4.z & 0xffff0000u) * x1.y
+    $|      + bitcast<f32>(u4.w << 16u) * x1.z
+    $|      + bitcast<f32>(u4.w & 0xffff0000u) * x1.w;
     $|  }
     $|  part[lid.x] = acc;
     $|  workgroupBarrier();
@@ -336,25 +343,25 @@ pub fn gemv_shader(out : Int, inn : Int) -> String {
 }
 
 ///|
-/// GEMM kernel: Y[s, out] = X[s, in] @ W[out, in]^T, both row-major.
+/// GEMM kernel, bf16 weights: Y[s, out] = X[s, in] @ W[out, in]^T.
+/// X row-major f32, W row-major bf16 (u32 pairs), Y f32.
 ///
-/// Classic 16x16 output tile per 256-thread workgroup; k streamed in
-/// 4-vec4 chunks through shared memory (2KB tiles), each thread owns one
-/// output element and accumulates with vec4 dots. Edges zero-padded via
-/// select. Requires in % 4 == 0.
+/// 16x16 output tile per 256-thread workgroup; k streamed in 8-element
+/// chunks: X tile staged as f32 (2KB), W tile as raw u32 (1KB), unpacked
+/// at use. Edges zero-padded via select. Requires in % 8 == 0.
 pub fn matmul_shader(s : Int, out : Int, inn : Int) -> String {
-  let in4 = inn / 4
   let src =
-    $|@group(0) @binding(0) var<storage, read> x : array<vec4<f32>>;
-    $|@group(0) @binding(1) var<storage, read> w : array<vec4<f32>>;
+    $|@group(0) @binding(0) var<storage, read> x : array<f32>;
+    $|@group(0) @binding(1) var<storage, read> w : array<u32>;
     $|@group(0) @binding(2) var<storage, read_write> y : array<f32>;
     $|
     $|const S : u32 = \{s}u;
     $|const OUT : u32 = \{out}u;
-    $|const IN4 : u32 = \{in4}u;
+    $|const IN : u32 = \{inn}u;
+    $|const IN2 : u32 = \{inn / 2}u;
     $|
-    $|var<workgroup> xs : array<vec4<f32>, 64>;
-    $|var<workgroup> ws : array<vec4<f32>, 64>;
+    $|var<workgroup> xs : array<f32, 128>; // 16 rows x 8 elems
+    $|var<workgroup> ws : array<u32, 64>; // 16 rows x 4 u32 (8 bf16)
     $|
     $|@compute @workgroup_size(256)
     $|fn main(
@@ -366,19 +373,24 @@ pub fn matmul_shader(s : Int, out : Int, inn : Int) -> String {
     $|  let tx = lid.x % 16u;
     $|  let ty = lid.x / 16u;
     $|  var acc = 0.0;
-    $|  for (var k0 = 0u; k0 < IN4; k0 = k0 + 4u) {
+    $|  for (var k0 = 0u; k0 < IN; k0 = k0 + 8u) {
+    $|    for (var t = lid.x; t < 128u; t = t + 256u) {
+    $|      let r = t / 8u;
+    $|      let c = t % 8u;
+    $|      let gi = row0 + r;
+    $|      xs[t] = select(0.0, x[gi * IN + k0 + c], gi < S);
+    $|    }
     $|    for (var t = lid.x; t < 64u; t = t + 256u) {
     $|      let r = t / 4u;
     $|      let c = t % 4u;
-    $|      let gi = row0 + r;
-    $|      let kk = k0 + c;
-    $|      xs[t] = select(vec4<f32>(0.0), x[gi * IN4 + kk], gi < S && kk < IN4);
     $|      let gj = col0 + r;
-    $|      ws[t] = select(vec4<f32>(0.0), w[gj * IN4 + kk], gj < OUT && kk < IN4);
+    $|      ws[t] = select(0u, w[gj * IN2 + k0 / 2u + c], gj < OUT);
     $|    }
     $|    workgroupBarrier();
     $|    for (var kk = 0u; kk < 4u; kk = kk + 1u) {
-    $|      acc = acc + dot(xs[ty * 4u + kk], ws[tx * 4u + kk]);
+    $|      let u = ws[tx * 4u + kk];
+    $|      acc = acc + xs[ty * 8u + kk * 2u] * bitcast<f32>(u << 16u)
+    $|        + xs[ty * 8u + kk * 2u + 1u] * bitcast<f32>(u & 0xffff0000u);
     $|    }
     $|    workgroupBarrier();
     $|  }
@@ -390,7 +402,6 @@ pub fn matmul_shader(s : Int, out : Int, inn : Int) -> String {
     $|}
   src
 }
-
 ///|
 /// RMSNorm: y[r, i] = x[r, i] * rsqrt(mean(x[r,:]^2) + eps) * w[i].
 /// One 256-thread workgroup per row, vec4 loads, shared-memory reduction.
@@ -607,6 +618,426 @@ pub fn attn_rows_shader(
     $|    acc = acc + sc[p] * vc[(p * HKV + kvh) * HD + lid.x];
     $|  }
     $|  outp[(row * HQ + head) * HD + lid.x] = acc * inv;
+    $|}
+  src
+}
+
+///|
+/// Embedding gather with bf16 unpack: for each row, dst[row, i] =
+/// f32(emb[ids[row] * n + i]). One thread per u32 (2 elements).
+/// Grid: (ceil(rows * n/2 / 256), 1). Requires n % 2 == 0.
+pub fn embed_rows_shader(rows : Int, n : Int) -> String {
+  let n2 = n / 2
+  let src =
+    $|@group(0) @binding(0) var<storage, read> emb : array<u32>;
+    $|@group(0) @binding(1) var<storage, read> ids : array<u32>;
+    $|@group(0) @binding(2) var<storage, read_write> dst : array<f32>;
+    $|
+    $|const R : u32 = \{rows}u;
+    $|const N : u32 = \{n}u;
+    $|const N2 : u32 = \{n2}u;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    $|  let i = gid.x;
+    $|  if (i >= R * N2) { return; }
+    $|  let row = i / N2;
+    $|  let c = i % N2;
+    $|  let u = emb[ids[row] * N2 + c];
+    $|  dst[row * N + c * 2u] = bitcast<f32>(u << 16u);
+    $|  dst[row * N + c * 2u + 1u] = bitcast<f32>(u & 0xffff0000u);
+    $|}
+  src
+}
+
+///|
+/// Fused QKV GEMV (decode): rows 0..nq-1 -> qout, nq..nq+nkv-1 -> kout,
+/// nq+nkv.. -> vout, where vout is the KV cache at params[0] (v is cached
+/// before use, so the projection writes it directly). bf16 weights.
+/// Same warp-per-row structure as gemv_shader. Grid: (ceil((nq+2nkv)/8), 1).
+pub fn qkv_fused_shader(nq : Int, nkv : Int, inn : Int) -> String {
+  let in2 = inn / 2
+  let src =
+    $|@group(0) @binding(0) var<storage, read> x : array<vec4<f32>>;
+    $|@group(0) @binding(1) var<storage, read> wq : array<u32>;
+    $|@group(0) @binding(2) var<storage, read> wk : array<u32>;
+    $|@group(0) @binding(3) var<storage, read> wv : array<u32>;
+    $|@group(0) @binding(4) var<storage, read_write> qout : array<f32>;
+    $|@group(0) @binding(5) var<storage, read_write> kout : array<f32>;
+    $|@group(0) @binding(6) var<storage, read_write> vc : array<f32>;
+    $|@group(0) @binding(7) var<storage, read> params : array<u32>;
+    $|
+    $|const NQ : u32 = \{nq}u;
+    $|const NKV : u32 = \{nkv}u;
+    $|const IN2 : u32 = \{in2}u;
+    $|
+    $|var<workgroup> xs : array<f32, 3072>;
+    $|var<workgroup> part : array<f32, 256>;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let rg = lid.x / 32u;
+    $|  let lane = lid.x % 32u;
+    $|  let o = wid.x * 8u + rg;
+    $|  let oo = min(o, NQ + 2u * NKV - 1u);
+    $|  for (var t = lid.x; t < IN2 * 2u; t = t + 256u) {
+    $|    xs[t] = x[t / 4u][t % 4u];
+    $|  }
+    $|  workgroupBarrier();
+    $|  var acc = 0.0;
+    $|  if (oo < NQ) {
+    $|    for (var t = lane; t < IN2; t = t + 32u) {
+    $|      let u = wq[oo * IN2 + t];
+    $|      acc = acc + bitcast<f32>(u << 16u) * xs[t * 2u]
+    $|        + bitcast<f32>(u & 0xffff0000u) * xs[t * 2u + 1u];
+    $|    }
+    $|  } else if (oo < NQ + NKV) {
+    $|    let r = oo - NQ;
+    $|    for (var t = lane; t < IN2; t = t + 32u) {
+    $|      let u = wk[r * IN2 + t];
+    $|      acc = acc + bitcast<f32>(u << 16u) * xs[t * 2u]
+    $|        + bitcast<f32>(u & 0xffff0000u) * xs[t * 2u + 1u];
+    $|    }
+    $|  } else {
+    $|    let r = oo - NQ - NKV;
+    $|    for (var t = lane; t < IN2; t = t + 32u) {
+    $|      let u = wv[r * IN2 + t];
+    $|      acc = acc + bitcast<f32>(u << 16u) * xs[t * 2u]
+    $|        + bitcast<f32>(u & 0xffff0000u) * xs[t * 2u + 1u];
+    $|    }
+    $|  }
+    $|  part[lid.x] = acc;
+    $|  workgroupBarrier();
+    $|  if (lane == 0u && o < NQ + 2u * NKV) {
+    $|    var sum = 0.0;
+    $|    for (var t = 0u; t < 32u; t = t + 1u) {
+    $|      sum = sum + part[rg * 32u + t];
+    $|    }
+    $|    if (o < NQ) {
+    $|      qout[o] = sum;
+    $|    } else if (o < NQ + NKV) {
+    $|      kout[o - NQ] = sum;
+    $|    } else {
+    $|      vc[params[0] * NKV + o - NQ - NKV] = sum;
+    $|    }
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// Fused gate+up GEMV (decode): rows 0..n-1 -> gout from wg, n..2n-1 ->
+/// uout from wu. bf16 weights. Grid: (ceil(2n/8), 1).
+pub fn gemv2_fused_shader(n : Int, inn : Int) -> String {
+  let in2 = inn / 2
+  let src =
+    $|@group(0) @binding(0) var<storage, read> x : array<vec4<f32>>;
+    $|@group(0) @binding(1) var<storage, read> wg : array<u32>;
+    $|@group(0) @binding(2) var<storage, read> wu : array<u32>;
+    $|@group(0) @binding(3) var<storage, read_write> gout : array<f32>;
+    $|@group(0) @binding(4) var<storage, read_write> uout : array<f32>;
+    $|
+    $|const N : u32 = \{n}u;
+    $|const IN2 : u32 = \{in2}u;
+    $|
+    $|var<workgroup> xs : array<f32, 3072>;
+    $|var<workgroup> part : array<f32, 256>;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let rg = lid.x / 32u;
+    $|  let lane = lid.x % 32u;
+    $|  let o = wid.x * 8u + rg;
+    $|  let oo = min(o, 2u * N - 1u);
+    $|  for (var t = lid.x; t < IN2 * 2u; t = t + 256u) {
+    $|    xs[t] = x[t / 4u][t % 4u];
+    $|  }
+    $|  workgroupBarrier();
+    $|  var acc = 0.0;
+    $|  if (oo < N) {
+    $|    for (var t = lane; t < IN2; t = t + 32u) {
+    $|      let u = wg[oo * IN2 + t];
+    $|      acc = acc + bitcast<f32>(u << 16u) * xs[t * 2u]
+    $|        + bitcast<f32>(u & 0xffff0000u) * xs[t * 2u + 1u];
+    $|    }
+    $|  } else {
+    $|    let r = oo - N;
+    $|    for (var t = lane; t < IN2; t = t + 32u) {
+    $|      let u = wu[r * IN2 + t];
+    $|      acc = acc + bitcast<f32>(u << 16u) * xs[t * 2u]
+    $|        + bitcast<f32>(u & 0xffff0000u) * xs[t * 2u + 1u];
+    $|    }
+    $|  }
+    $|  part[lid.x] = acc;
+    $|  workgroupBarrier();
+    $|  if (lane == 0u && o < 2u * N) {
+    $|    var sum = 0.0;
+    $|    for (var t = 0u; t < 32u; t = t + 1u) {
+    $|      sum = sum + part[rg * 32u + t];
+    $|    }
+    $|    if (o < N) {
+    $|      gout[o] = sum;
+    $|    } else {
+    $|      uout[o - N] = sum;
+    $|    }
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// Fused per-head RMSNorm + NeoX RoPE for q and k (decode, one row).
+/// Workgroup h < HQ handles q head h in place; h >= HQ handles k head
+/// h-HQ, writing the normed+rotated result directly into the KV cache at
+/// params[0]. 64 threads = 64 pairs; each thread norms AND rotates its
+/// pair (both halves loaded up front). bf16... no — norm weights are f32.
+/// Grid: (HQ + HKV, 1). Requires hd = 128.
+pub fn qknorm_rope_shader(
+  hq : Int,
+  hkv : Int,
+  hd : Int,
+  eps : Float,
+) -> String {
+  let half = hd / 2
+  let src =
+    $|@group(0) @binding(0) var<storage, read_write> q : array<f32>;
+    $|@group(0) @binding(1) var<storage, read> k : array<f32>;
+    $|@group(0) @binding(2) var<storage, read> qnw : array<f32>;
+    $|@group(0) @binding(3) var<storage, read> knw : array<f32>;
+    $|@group(0) @binding(4) var<storage, read_write> kc : array<f32>;
+    $|@group(0) @binding(5) var<storage, read> cost : array<f32>;
+    $|@group(0) @binding(6) var<storage, read> sint : array<f32>;
+    $|@group(0) @binding(7) var<storage, read> params : array<u32>;
+    $|
+    $|const HQ : u32 = \{hq}u;
+    $|const HD : u32 = \{hd}u;
+    $|const HALF : u32 = \{half}u;
+    $|const EPS : f32 = \{eps};
+    $|
+    $|var<workgroup> part : array<f32, 64>;
+    $|var<workgroup> inv_s : f32;
+    $|
+    $|@compute @workgroup_size(64)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let is_q = wid.x < HQ;
+    $|  let head = select(wid.x - HQ, wid.x, is_q);
+    $|  let base = head * HD + lid.x;
+    $|  let v1 = select(k[base], q[base], is_q);
+    $|  let v2 = select(k[base + HALF], q[base + HALF], is_q);
+    $|  part[lid.x] = v1 * v1 + v2 * v2;
+    $|  workgroupBarrier();
+    $|  if (lid.x == 0u) {
+    $|    var sum = 0.0;
+    $|    for (var t = 0u; t < 64u; t = t + 1u) { sum = sum + part[t]; }
+    $|    inv_s = 1.0 / sqrt(sum / f32(HD) + EPS);
+    $|  }
+    $|  workgroupBarrier();
+    $|  let inv = inv_s;
+    $|  let n1 = v1 * inv * select(knw[lid.x], qnw[lid.x], is_q);
+    $|  let n2 = v2 * inv * select(knw[lid.x + HALF], qnw[lid.x + HALF], is_q);
+    $|  let pos = params[0];
+    $|  let c = cost[pos * HALF + lid.x];
+    $|  let s = sint[pos * HALF + lid.x];
+    $|  let o1 = n1 * c - n2 * s;
+    $|  let o2 = n1 * s + n2 * c;
+    $|  if (is_q) {
+    $|    q[base] = o1;
+    $|    q[base + HALF] = o2;
+    $|  } else {
+    $|    let cb = (pos * \{hkv}u + head) * HD + lid.x;
+    $|    kc[cb] = o1;
+    $|    kc[cb + HALF] = o2;
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// Fused residual add + RMSNorm: x[r] += d[r]; y[r] = rmsnorm(x[r]) * w.
+/// One workgroup per row, 256 threads vec4. Grid: (rows, 1).
+pub fn add_rmsnorm_shader(n : Int, eps : Float) -> String {
+  let n4 = n / 4
+  let src =
+    $|@group(0) @binding(0) var<storage, read_write> x : array<vec4<f32>>;
+    $|@group(0) @binding(1) var<storage, read> d : array<vec4<f32>>;
+    $|@group(0) @binding(2) var<storage, read> w : array<vec4<f32>>;
+    $|@group(0) @binding(3) var<storage, read_write> y : array<vec4<f32>>;
+    $|
+    $|const N : u32 = \{n}u;
+    $|const N4 : u32 = \{n4}u;
+    $|const EPS : f32 = \{eps};
+    $|
+    $|var<workgroup> part : array<f32, 256>;
+    $|var<workgroup> inv_s : f32;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let base = wid.x * N4;
+    $|  var ss = 0.0;
+    $|  for (var t = lid.x; t < N4; t = t + 256u) {
+    $|    let v = x[base + t] + d[base + t];
+    $|    x[base + t] = v;
+    $|    ss = ss + dot(v, v);
+    $|  }
+    $|  part[lid.x] = ss;
+    $|  workgroupBarrier();
+    $|  if (lid.x == 0u) {
+    $|    var sum = 0.0;
+    $|    for (var t = 0u; t < 256u; t = t + 1u) { sum = sum + part[t]; }
+    $|    inv_s = 1.0 / sqrt(sum / f32(N) + EPS);
+    $|  }
+    $|  workgroupBarrier();
+    $|  let inv = inv_s;
+    $|  for (var t = lid.x; t < N4; t = t + 256u) {
+    $|    y[base + t] = x[base + t] * inv * w[t];
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// Down-projection GEMV with fused activation: x staging computes
+/// xs[i] = silu(g[i]) * u[i] on the fly. bf16 weights, warp-per-row.
+/// Grid: (ceil(out/8), 1). Requires inn % 2 == 0.
+pub fn gemv_silu_shader(out : Int, inn : Int) -> String {
+  let in2 = inn / 2
+  let src =
+    $|@group(0) @binding(0) var<storage, read> w : array<u32>;
+    $|@group(0) @binding(1) var<storage, read> g : array<vec4<f32>>;
+    $|@group(0) @binding(2) var<storage, read> u : array<vec4<f32>>;
+    $|@group(0) @binding(3) var<storage, read_write> y : array<f32>;
+    $|
+    $|const OUT : u32 = \{out}u;
+    $|const IN2 : u32 = \{in2}u;
+    $|
+    $|var<workgroup> xs : array<f32, 3072>;
+    $|var<workgroup> part : array<f32, 256>;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let rg = lid.x / 32u;
+    $|  let lane = lid.x % 32u;
+    $|  let o = wid.x * 8u + rg;
+    $|  let oo = min(o, OUT - 1u);
+    $|  for (var t = lid.x; t < IN2 * 2u; t = t + 256u) {
+    $|    let gv = g[t / 4u][t % 4u];
+    $|    xs[t] = gv / (1.0 + exp(-gv)) * u[t / 4u][t % 4u];
+    $|  }
+    $|  workgroupBarrier();
+    $|  var acc = 0.0;
+    $|  for (var t = lane; t < IN2; t = t + 32u) {
+    $|    let uu = w[oo * IN2 + t];
+    $|    acc = acc + bitcast<f32>(uu << 16u) * xs[t * 2u]
+    $|      + bitcast<f32>(uu & 0xffff0000u) * xs[t * 2u + 1u];
+    $|  }
+    $|  part[lid.x] = acc;
+    $|  workgroupBarrier();
+    $|  if (lane == 0u && o < OUT) {
+    $|    var sum = 0.0;
+    $|    for (var t = 0u; t < 32u; t = t + 1u) {
+    $|      sum = sum + part[rg * 32u + t];
+    $|    }
+    $|    y[o] = sum;
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// Argmax phase 1: each 256-thread workgroup scans CHUNK consecutive
+/// logits; thread 0 serial-reduces the 256 (val, idx) partials.
+/// part_v[wid] / part_i[wid] hold the workgroup winner. Grid: (wgs, 1).
+pub fn argmax1_shader(n : Int, chunk : Int) -> String {
+  let src =
+    $|@group(0) @binding(0) var<storage, read> x : array<f32>;
+    $|@group(0) @binding(1) var<storage, read_write> part_v : array<f32>;
+    $|@group(0) @binding(2) var<storage, read_write> part_i : array<f32>;
+    $|
+    $|const N : u32 = \{n}u;
+    $|const CHUNK : u32 = \{chunk}u;
+    $|
+    $|var<workgroup> pv : array<f32, 256>;
+    $|var<workgroup> pi : array<f32, 256>;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  var bv = -3.402823466e+38;
+    $|  var bi = 0u;
+    $|  let base = wid.x * CHUNK;
+    $|  for (var t = lid.x; t < CHUNK; t = t + 256u) {
+    $|    let i = base + t;
+    $|    if (i < N) {
+    $|      let v = x[i];
+    $|      if (v > bv) { bv = v; bi = i; }
+    $|    }
+    $|  }
+    $|  pv[lid.x] = bv;
+    $|  pi[lid.x] = f32(bi);
+    $|  workgroupBarrier();
+    $|  if (lid.x == 0u) {
+    $|    var mv = -3.402823466e+38;
+    $|    var mi = 0.0;
+    $|    for (var t = 0u; t < 256u; t = t + 1u) {
+    $|      if (pv[t] > mv) { mv = pv[t]; mi = pi[t]; }
+    $|    }
+    $|    part_v[wid.x] = mv;
+    $|    part_i[wid.x] = mi;
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// Argmax phase 2: one 256-thread workgroup reduces WGS partials; out[0]
+/// gets the winning index as f32 (vocab < 2^24, exact).
+pub fn argmax2_shader(wgs : Int) -> String {
+  let src =
+    $|@group(0) @binding(0) var<storage, read> part_v : array<f32>;
+    $|@group(0) @binding(1) var<storage, read> part_i : array<f32>;
+    $|@group(0) @binding(2) var<storage, read_write> outp : array<f32>;
+    $|
+    $|const WGS : u32 = \{wgs}u;
+    $|
+    $|var<workgroup> pv : array<f32, 256>;
+    $|var<workgroup> pi : array<f32, 256>;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(@builtin(local_invocation_id) lid : vec3<u32>) {
+    $|  var bv = -3.402823466e+38;
+    $|  var bi = 0.0;
+    $|  for (var t = lid.x; t < WGS; t = t + 256u) {
+    $|    let v = part_v[t];
+    $|    if (v > bv) { bv = v; bi = part_i[t]; }
+    $|  }
+    $|  pv[lid.x] = bv;
+    $|  pi[lid.x] = bi;
+    $|  workgroupBarrier();
+    $|  if (lid.x == 0u) {
+    $|    var mv = -3.402823466e+38;
+    $|    var mi = 0.0;
+    $|    for (var t = 0u; t < 256u; t = t + 1u) {
+    $|      if (pv[t] > mv) { mv = pv[t]; mi = pi[t]; }
+    $|    }
+    $|    outp[0] = mi;
+    $|  }
     $|}
   src
 }

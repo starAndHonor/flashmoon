@@ -69,6 +69,8 @@ extern "js" fn GPUAdapter::request_device_cb(
   #|  self.requestDevice({ requiredLimits: {
   #|    maxBufferSize: l.maxBufferSize,
   #|    maxStorageBufferBindingSize: l.maxStorageBufferBindingSize,
+  #|    maxComputeInvocationsPerWorkgroup: l.maxComputeInvocationsPerWorkgroup,
+  #|    maxComputeWorkgroupSizeX: l.maxComputeWorkgroupSizeX,
   #|  } }).then(cb);
   #|}
 
@@ -338,3 +340,40 @@ pub extern "js" fn GPUQueue::on_submitted_done(
   cb : (Bool) -> Unit,
 ) -> Unit =
   #|(self, cb) => self.onSubmittedWorkDone().then(cb)
+
+///|
+/// Raw host bytes view (Uint8Array) — for zero-conversion weight upload
+/// (BF16 payloads stored verbatim, unpacked in-kernel).
+pub type RawBuf
+
+///|
+pub extern "js" fn RawBuf::byte_len(self : RawBuf) -> Int =
+  #|(self) => self.byteLength
+
+///|
+/// Byte view over a Bytes payload (js Bytes = Uint8Array).
+pub extern "js" fn bytes_view(data : Bytes, off : Int, byte_len : Int) -> RawBuf =
+  #|(data, off, byte_len) => new Uint8Array(data.buffer, data.byteOffset + off, byte_len)
+
+///|
+/// f32 -> BF16 truncation (u16 array), for feeding test matrices to the
+/// bf16 weight kernels.
+pub extern "js" fn to_bf16(data : FixedArray[Float]) -> RawBuf =
+  #|(data) => { const u = new Uint16Array(data.length); const f = new Float32Array(1); const b = new Uint32Array(f.buffer); for (let i = 0; i < data.length; i++) { f[0] = data[i]; u[i] = b[0] >>> 16; } return u; }
+
+///|
+pub extern "js" fn GPUQueue::write_buffer_raw(
+  self : GPUQueue,
+  buf : GPUBuffer,
+  data : RawBuf,
+) -> Unit =
+  #|(self, buf, data) => self.writeBuffer(buf, 0, data)
+
+///|
+/// Upload an array of u32 (e.g. token ids for the embedding gather).
+pub extern "js" fn GPUQueue::write_u32_array(
+  self : GPUQueue,
+  buf : GPUBuffer,
+  data : Array[Int],
+) -> Unit =
+  #|(self, buf, data) => self.writeBuffer(buf, 0, new Uint32Array(data))
