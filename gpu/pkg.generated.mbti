@@ -2,11 +2,41 @@
 package "starAndHonor/flashmoon/gpu"
 
 // Values
+pub fn add_rmsnorm_shader(Int, Float) -> String
+
+pub fn add_shader(Int) -> String
+
+pub fn argmax1_shader(Int, Int) -> String
+
+pub fn argmax2_shader(Int) -> String
+
 pub fn attention_shader(Int, Int, Int, Int) -> String
+
+pub fn attn_rows_shader(Int, Int, Int, Int, Double) -> String
 
 pub fn combine_shader(Int, Int, Int) -> String
 
+pub fn embed_rows_shader(Int, Int) -> String
+
+pub fn gemv2_fused_shader(Int, Int) -> String
+
+pub fn gemv_shader(Int, Int) -> String
+
+pub fn gemv_silu_shader(Int, Int) -> String
+
+pub fn matmul_shader(Int, Int, Int) -> String
+
 pub fn partial_shader(Int, Int, Int, Int, Int) -> String
+
+pub fn qknorm_rope_shader(Int, Int, Int, Float) -> String
+
+pub fn qkv_fused_shader(Int, Int, Int) -> String
+
+pub fn rmsnorm_shader(Int, Float) -> String
+
+pub fn rope_shader(Int, Int, Int) -> String
+
+pub fn silu_mul_shader(Int) -> String
 
 // Errors
 

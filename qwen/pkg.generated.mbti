@@ -1,0 +1,67 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "starAndHonor/flashmoon/qwen"
+
+// Values
+
+// Errors
+
+// Types and methods
+type Layer
+
+type Mat
+
+pub struct Qwen3 {
+  embed : Mat
+  layers : Array[Layer]
+  norm : FixedArray[Float]
+  n_layer : Int
+  hidden : Int
+  n_head : Int
+  n_kv : Int
+  head_dim : Int
+  intermediate : Int
+  eps : Float
+  rope_theta : Double
+  vocab : Int
+}
+pub fn Qwen3::forward(Self, Array[Int]) -> FixedArray[Float]
+pub fn Qwen3::load(SafeTensors) -> Self raise
+
+pub struct SafeTensors {
+  data : Bytes
+  entries : Map[String, TensorInfo]
+}
+pub fn SafeTensors::get_f32(Self, String) -> (FixedArray[Float], Array[Int]) raise
+pub fn SafeTensors::parse(Bytes) -> Self raise
+pub fn SafeTensors::raw(Self, String) -> (Bytes, Int, Int, String) raise
+
+pub struct StreamDecoder {
+  tk : Tokenizer
+  buf : Array[Byte]
+  mut shown : Int
+}
+pub fn StreamDecoder::new(Tokenizer) -> Self
+pub fn StreamDecoder::push(Self, Int) -> String raise
+
+pub struct TensorInfo {
+  dtype : String
+  shape : Array[Int]
+  begin : Int
+  end : Int
+}
+
+pub struct Tokenizer {
+  id_to_tok : Array[String]
+  tok_to_id : Map[String, Int]
+  merge_rank : Map[String, Int]
+  char_to_byte : Map[Char, Int]
+}
+pub fn Tokenizer::decode(Self, Array[Int]) -> String raise
+pub fn Tokenizer::encode(Self, String) -> Array[Int] raise
+pub fn Tokenizer::load(String) -> Self raise
+pub fn Tokenizer::token_bytes(Self, Int) -> Array[Byte] raise
+
+// Type aliases
+
+// Traits
+
