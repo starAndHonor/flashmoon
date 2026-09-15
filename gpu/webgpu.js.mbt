@@ -58,11 +58,19 @@ pub fn GPU::request_adapter(self : GPU, cb : (GPUAdapter) -> Unit) -> Unit {
 }
 
 ///|
+/// Request a device with the adapter's maximum buffer limits (lm_head f32
+/// needs a 608MB storage binding, far above the 128MB default).
 extern "js" fn GPUAdapter::request_device_cb(
   self : GPUAdapter,
   cb : (GPUDevice) -> Unit,
 ) -> Unit =
-  #|(self, cb) => self.requestDevice().then(cb)
+  #|(self, cb) => {
+  #|  const l = self.limits;
+  #|  self.requestDevice({ requiredLimits: {
+  #|    maxBufferSize: l.maxBufferSize,
+  #|    maxStorageBufferBindingSize: l.maxStorageBufferBindingSize,
+  #|  } }).then(cb);
+  #|}
 
 ///|
 pub fn GPUAdapter::request_device(
@@ -112,6 +120,38 @@ pub extern "js" fn GPUDevice::on_uncaptured_error(
 ///|
 pub extern "js" fn GPUAdapter::info_string(self : GPUAdapter) -> String =
   #|(self) => self.info ? `${self.info.vendor}|${self.info.architecture}|${self.info.device || ""}|${self.info.description || ""}` : "noinfo"
+
+///|
+pub extern "js" fn GPUAdapter::limit_string(self : GPUAdapter) -> String =
+  #|(self) => `maxBuffer=${self.limits.maxBufferSize} maxStorageBinding=${self.limits.maxStorageBufferBindingSize}`
+
+///|
+/// Host-side f32 tensor (JS Float32Array) — unlike MoonBit
+/// FixedArray[Float] on js, typed arrays have no 2^27 element cap.
+pub type F32Buf
+
+///|
+pub extern "js" fn F32Buf::byte_len(self : F32Buf) -> Int =
+  #|(self) => self.byteLength
+
+///|
+/// queue.writeBuffer(buf, off, typedArray) — any size, no JS-array cap.
+pub extern "js" fn GPUQueue::write_buffer_f32(
+  self : GPUQueue,
+  buf : GPUBuffer,
+  off : Int,
+  data : F32Buf,
+) -> Unit =
+  #|(self, buf, off, data) => self.writeBuffer(buf, off, data)
+
+///|
+/// Write one u32 (kernel params like rope/attention position base).
+pub extern "js" fn GPUQueue::write_u32(
+  self : GPUQueue,
+  buf : GPUBuffer,
+  v : Int,
+) -> Unit =
+  #|(self, buf, v) => self.writeBuffer(buf, 0, new Uint32Array([v]))
 
 ///|
 extern "js" fn GPUBuffer::map_async_cb(

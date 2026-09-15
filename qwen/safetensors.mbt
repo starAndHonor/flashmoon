@@ -102,3 +102,18 @@ pub fn SafeTensors::get_f32(
   }
   (out, info.shape)
 }
+
+///|
+/// Raw tensor payload without decoding: (bytes, byte_offset, n_elems,
+/// dtype). For extern upload paths (GPU) where a full FixedArray[Float]
+/// decode would exceed the js backend's 2^27-element array cap.
+pub fn SafeTensors::raw(
+  self : SafeTensors,
+  name : String,
+) -> (Bytes, Int, Int, String) raise Error {
+  guard self.entries.get(name) is Some(info) else {
+    raise Failure("tensor not found: \{name}")
+  }
+  let n = info.shape.fold(init=1, fn(acc, d) { acc * d })
+  (self.data, info.begin, n, info.dtype)
+}

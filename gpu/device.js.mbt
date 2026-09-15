@@ -31,11 +31,12 @@ pub fn Gpu::init(
   log? : (String) -> Unit = fn(_) { () },
 ) -> Unit {
   gpu().request_adapter(fn(adapter) {
-    log("adapter: \{adapter.info_string()}")
+    log("adapter: \{adapter.info_string()} | \{adapter.limit_string()}")
     adapter.request_device(fn(device) {
       log(
         "device maxComputeWorkgroupStorageSize=\{device.max_workgroup_storage()}",
       )
+    device.on_uncaptured_error(fn(msg) { log("GPU ERROR: \{msg}") })
       cb({ device, queue: device.get_queue(), pipelines: Map([]) })
     })
   })
@@ -247,4 +248,148 @@ fn pick_splits(m : Int) -> Int {
   } else {
     s
   }
+}
+
+///|
+/// Upload a host typed array (any length — no JS-array element cap).
+pub fn Gpu::upload_typed(self : Gpu, data : F32Buf) -> GPUBuffer {
+  let buf = self.device.create_buffer(
+    data.byte_len(),
+    USAGE_STORAGE | USAGE_COPY_SRC | USAGE_COPY_DST,
+    mapped_at_creation=false,
+  )
+  self.queue.write_buffer_f32(buf, 0, data)
+  buf
+}
+
+///|
+/// One u32 of kernel params (rope/attention position base).
+pub fn Gpu::alloc_u32(self : Gpu) -> GPUBuffer {
+  self.device.create_buffer(4, USAGE_STORAGE | USAGE_COPY_DST, mapped_at_creation=false)
+}
+
+///|
+pub fn Gpu::set_u32(self : Gpu, buf : GPUBuffer, v : Int) -> Unit {
+  self.queue.write_u32(buf, v)
+}
+
+///|
+/// Embedding row gather: dst[0..n] = emb[token*n .. token*n + n].
+pub fn Gpu::embed(
+  self : Gpu,
+  emb : GPUBuffer,
+  dst : GPUBuffer,
+  token : Int,
+  n : Int,
+) -> Unit {
+  let enc = self.device.create_command_encoder()
+  enc.copy_buffer_to_buffer(emb, token * n * 4, dst, 0, n * 4)
+  self.queue.submit([enc.finish()])
+}
+
+///|
+/// Block copy of `n` floats between storage buffers.
+pub fn Gpu::copy(
+  self : Gpu,
+  src : GPUBuffer,
+  src_off : Int,
+  dst : GPUBuffer,
+  dst_off : Int,
+  n : Int,
+) -> Unit {
+  let enc = self.device.create_command_encoder()
+  enc.copy_buffer_to_buffer(src, src_off * 4, dst, dst_off * 4, n * 4)
+  self.queue.submit([enc.finish()])
+}
+
+///|
+/// RMSNorm over `rows` rows of length `n`; in-place safe (x == y).
+pub fn Gpu::rmsnorm(
+  self : Gpu,
+  x : GPUBuffer,
+  w : GPUBuffer,
+  y : GPUBuffer,
+  rows : Int,
+  n : Int,
+  eps : Float,
+) -> Unit {
+  if n % 4 != 0 {
+    abort("rmsnorm: n must be a multiple of 4, got \{n}")
+  }
+  let p = self.pipeline("rms:\{n}:\{eps}", fn() { rmsnorm_shader(n, eps) })
+  self.run_pass(p, [x, w, y], rows, 1)
+}
+
+///|
+/// NeoX RoPE in place over x [rows, heads*2*half]; pos = pos0 + row.
+pub fn Gpu::rope(
+  self : Gpu,
+  x : GPUBuffer,
+  cost : GPUBuffer,
+  sint : GPUBuffer,
+  pos0 : GPUBuffer,
+  rows : Int,
+  heads : Int,
+  half : Int,
+) -> Unit {
+  let p = self.pipeline("rope:\{rows},\{heads},\{half}", fn() {
+    rope_shader(rows, heads, half)
+  })
+  self.run_pass(p, [x, cost, sint, pos0], (rows * heads * half + 255) / 256, 1)
+}
+
+///|
+/// y = silu(g) * u elementwise over n floats.
+pub fn Gpu::silu_mul(
+  self : Gpu,
+  g : GPUBuffer,
+  u : GPUBuffer,
+  y : GPUBuffer,
+  n : Int,
+) -> Unit {
+  if n % 4 != 0 {
+    abort("silu_mul: n must be a multiple of 4, got \{n}")
+  }
+  let p = self.pipeline("silu:\{n}", fn() { silu_mul_shader(n) })
+  self.run_pass(p, [g, u, y], (n / 4 + 255) / 256, 1)
+}
+
+///|
+/// x += y elementwise over n floats (residual).
+pub fn Gpu::add(self : Gpu, x : GPUBuffer, y : GPUBuffer, n : Int) -> Unit {
+  if n % 4 != 0 {
+    abort("add: n must be a multiple of 4, got \{n}")
+  }
+  let p = self.pipeline("add:\{n}", fn() { add_shader(n) })
+  self.run_pass(p, [x, y], (n / 4 + 255) / 256, 1)
+}
+
+///|
+/// Multi-row causal GQA attention over KV caches [max_pos, hkv*hd].
+/// q [rows, hq*hd] -> out [rows, hq*hd]; row r attends 0..pos0+r where
+/// pos0 = params[0]. Covers prefill (rows = prompt) and decode (rows = 1).
+pub fn Gpu::attn_rows(
+  self : Gpu,
+  q : GPUBuffer,
+  kc : GPUBuffer,
+  vc : GPUBuffer,
+  out : GPUBuffer,
+  pos0 : GPUBuffer,
+  rows : Int,
+  hq : Int,
+  hkv : Int,
+  hd : Int,
+  max_pos : Int,
+) -> Unit {
+  if hd != 128 {
+    abort("attn_rows: only hd=128 (thread-per-dim) is implemented, got \{hd}")
+  }
+  if hq % hkv != 0 {
+    abort("attn_rows: hq % hkv != 0")
+  }
+  let scale = 1.0 / hd.to_double().sqrt()
+  let p = self.pipeline("attn:\{hq},\{hkv},\{hd},\{max_pos}", fn() {
+    attn_rows_shader(hq, hkv, hd, max_pos, scale)
+  })
+  self.run_pass(p, [q, kc, vc, out, pos0], hq, rows)
 }

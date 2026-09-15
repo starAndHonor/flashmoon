@@ -390,3 +390,223 @@ pub fn matmul_shader(s : Int, out : Int, inn : Int) -> String {
     $|}
   src
 }
+
+///|
+/// RMSNorm: y[r, i] = x[r, i] * rsqrt(mean(x[r,:]^2) + eps) * w[i].
+/// One 256-thread workgroup per row, vec4 loads, shared-memory reduction.
+/// In-place safe (x == y): each thread writes only indices it read.
+/// Grid: (rows, 1). Requires n % 4 == 0, n/4 <= 768 * 4? No shared staging
+/// of x — n is only bounded by the reduction loop, any n % 4 == 0 works.
+pub fn rmsnorm_shader(n : Int, eps : Float) -> String {
+  let n4 = n / 4
+  let src =
+    $|// x is read_write so in-place calls (y == x) bind the same buffer
+    $|// under one storage usage (read-only + read-write would be rejected).
+    $|@group(0) @binding(0) var<storage, read_write> x : array<vec4<f32>>;
+    $|@group(0) @binding(1) var<storage, read> w : array<vec4<f32>>;
+    $|@group(0) @binding(2) var<storage, read_write> y : array<vec4<f32>>;
+    $|
+    $|const N : u32 = \{n}u;
+    $|const N4 : u32 = \{n4}u;
+    $|const EPS : f32 = \{eps};
+    $|
+    $|var<workgroup> part : array<f32, 256>;
+    $|var<workgroup> inv_s : f32;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let base = wid.x * N4;
+    $|  var ss = 0.0;
+    $|  for (var t = lid.x; t < N4; t = t + 256u) {
+    $|    let v = x[base + t];
+    $|    ss = ss + dot(v, v);
+    $|  }
+    $|  part[lid.x] = ss;
+    $|  workgroupBarrier();
+    $|  if (lid.x == 0u) {
+    $|    var sum = 0.0;
+    $|    for (var t = 0u; t < 256u; t = t + 1u) { sum = sum + part[t]; }
+    $|    inv_s = 1.0 / sqrt(sum / f32(N) + EPS);
+    $|  }
+    $|  workgroupBarrier();
+    $|  let inv = inv_s;
+    $|  for (var t = lid.x; t < N4; t = t + 256u) {
+    $|    y[base + t] = x[base + t] * inv * w[t];
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// NeoX RoPE over x [rows, heads*2*half], in place: for pair j of head h
+/// at position pos0 + row, (a, b) = (x[.. j], x[.. j+half]) rotates by
+/// (cos[pos, j], sin[pos, j]) from precomputed tables [max_pos, half].
+/// One thread per pair. Grid: (ceil(rows*heads*half / 256), 1).
+pub fn rope_shader(rows : Int, heads : Int, half : Int) -> String {
+  let src =
+    $|@group(0) @binding(0) var<storage, read_write> x : array<f32>;
+    $|@group(0) @binding(1) var<storage, read> cost : array<f32>;
+    $|@group(0) @binding(2) var<storage, read> sint : array<f32>;
+    $|@group(0) @binding(3) var<storage, read> params : array<u32>;
+    $|
+    $|const S : u32 = \{rows}u;
+    $|const H : u32 = \{heads}u;
+    $|const HALF : u32 = \{half}u;
+    $|const HD : u32 = \{half * 2}u;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    $|  let i = gid.x;
+    $|  if (i >= S * H * HALF) { return; }
+    $|  let row = i / (H * HALF);
+    $|  let r = i % (H * HALF);
+    $|  let head = r / HALF;
+    $|  let j = r % HALF;
+    $|  let pos = params[0] + row;
+    $|  let base = (row * H + head) * HD + j;
+    $|  let c = cost[pos * HALF + j];
+    $|  let s = sint[pos * HALF + j];
+    $|  let a = x[base];
+    $|  let b = x[base + HALF];
+    $|  x[base] = a * c - b * s;
+    $|  x[base + HALF] = a * s + b * c;
+    $|}
+  src
+}
+
+///|
+/// y[i] = silu(g[i]) * u[i], vec4 elementwise. Grid: (ceil(n/1024), 1).
+/// In-place safe on any argument.
+pub fn silu_mul_shader(n : Int) -> String {
+  let n4 = n / 4
+  let src =
+    $|// read_write so in-place calls (y == g) bind one storage usage.
+    $|@group(0) @binding(0) var<storage, read_write> g : array<vec4<f32>>;
+    $|@group(0) @binding(1) var<storage, read> u : array<vec4<f32>>;
+    $|@group(0) @binding(2) var<storage, read_write> y : array<vec4<f32>>;
+    $|
+    $|const N4 : u32 = \{n4}u;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    $|  let i = gid.x;
+    $|  if (i >= N4) { return; }
+    $|  let gv = g[i];
+    $|  y[i] = gv / (vec4<f32>(1.0) + exp(-gv)) * u[i];
+    $|}
+  src
+}
+
+///|
+/// x[i] += y[i], vec4 elementwise. Grid: (ceil(n/1024), 1).
+pub fn add_shader(n : Int) -> String {
+  let n4 = n / 4
+  let src =
+    $|@group(0) @binding(0) var<storage, read_write> x : array<vec4<f32>>;
+    $|@group(0) @binding(1) var<storage, read> y : array<vec4<f32>>;
+    $|
+    $|const N4 : u32 = \{n4}u;
+    $|
+    $|@compute @workgroup_size(256)
+    $|fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    $|  let i = gid.x;
+    $|  if (i >= N4) { return; }
+    $|  x[i] = x[i] + y[i];
+    $|}
+  src
+}
+
+///|
+/// Multi-row causal GQA attention, one workgroup per (q head, query row):
+/// q [rows, hq*hd], kv caches [max_pos, hkv*hd], out [rows, hq*hd].
+/// Row r attends positions 0..pos0+r (params[0] = pos0) — one kernel for
+/// both prefill (rows = prompt, pos0 = 0) and decode (rows = 1).
+///
+/// 128 threads: stage q row, score all m positions (thread-strided rows
+/// of the kv head), shared max/sum reductions, then thread-per-dim
+/// weighted V accumulation. Scores live in shared memory (max_pos * 4B).
+/// Grid: (hq, rows). Requires hd == 128 (thread-per-dim mapping).
+pub fn attn_rows_shader(
+  hq : Int,
+  hkv : Int,
+  hd : Int,
+  max_pos : Int,
+  scale : Double,
+) -> String {
+  let src =
+    $|@group(0) @binding(0) var<storage, read> q : array<f32>;
+    $|@group(0) @binding(1) var<storage, read> kc : array<f32>;
+    $|@group(0) @binding(2) var<storage, read> vc : array<f32>;
+    $|@group(0) @binding(3) var<storage, read_write> outp : array<f32>;
+    $|@group(0) @binding(4) var<storage, read> params : array<u32>;
+    $|
+    $|const HQ : u32 = \{hq}u;
+    $|const HKV : u32 = \{hkv}u;
+    $|const HD : u32 = \{hd}u;
+    $|const GROUP : u32 = \{hq / hkv}u;
+    $|const SCALE : f32 = \{scale};
+    $|
+    $|var<workgroup> qs : array<f32, \{hd}>;
+    $|var<workgroup> sc : array<f32, \{max_pos}>;
+    $|var<workgroup> part : array<f32, 128>;
+    $|var<workgroup> bcast : array<f32, 2>; // 0: max, 1: sum
+    $|
+    $|@compute @workgroup_size(128)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let head = wid.x;
+    $|  let row = wid.y;
+    $|  let kvh = head / GROUP;
+    $|  let m = params[0] + row + 1u;
+    $|  qs[lid.x] = q[(row * HQ + head) * HD + lid.x];
+    $|  workgroupBarrier();
+    $|  // scores
+    $|  var lmax = -3.402823466e+38;
+    $|  for (var p = lid.x; p < m; p = p + 128u) {
+    $|    let kb = (p * HKV + kvh) * HD;
+    $|    var acc = 0.0;
+    $|    for (var d = 0u; d < HD; d = d + 1u) {
+    $|      acc = acc + qs[d] * kc[kb + d];
+    $|    }
+    $|    let s = acc * SCALE;
+    $|    sc[p] = s;
+    $|    lmax = max(lmax, s);
+    $|  }
+    $|  part[lid.x] = lmax;
+    $|  workgroupBarrier();
+    $|  if (lid.x == 0u) {
+    $|    var mx = -3.402823466e+38;
+    $|    for (var t = 0u; t < 128u; t = t + 1u) { mx = max(mx, part[t]); }
+    $|    bcast[0] = mx;
+    $|  }
+    $|  workgroupBarrier();
+    $|  let mx = bcast[0];
+    $|  var lsum = 0.0;
+    $|  for (var p = lid.x; p < m; p = p + 128u) {
+    $|    let e = exp(sc[p] - mx);
+    $|    sc[p] = e;
+    $|    lsum = lsum + e;
+    $|  }
+    $|  part[lid.x] = lsum;
+    $|  workgroupBarrier();
+    $|  if (lid.x == 0u) {
+    $|    var sm = 0.0;
+    $|    for (var t = 0u; t < 128u; t = t + 1u) { sm = sm + part[t]; }
+    $|    bcast[1] = sm;
+    $|  }
+    $|  workgroupBarrier();
+    $|  let inv = 1.0 / bcast[1];
+    $|  // weighted V sum, thread per output dim
+    $|  var acc = 0.0;
+    $|  for (var p = 0u; p < m; p = p + 1u) {
+    $|    acc = acc + sc[p] * vc[(p * HKV + kvh) * HD + lid.x];
+    $|  }
+    $|  outp[(row * HQ + head) * HD + lid.x] = acc * inv;
+    $|}
+  src
+}
