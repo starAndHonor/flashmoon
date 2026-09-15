@@ -23,6 +23,41 @@ extern "js" fn bytes_to_string(b : Bytes) -> String =
   #|(b) => new TextDecoder().decode(b)
 
 ///|
+extern "js" fn print_raw(s : String) -> Unit =
+  #| (s) => { Deno.stdout.writeSync(new TextEncoder().encode(s)); }
+
+///|
+extern "js" fn read_line(cb : (String) -> Unit, eof : () -> Unit) -> Unit =
+  #| (cb, eof) => {
+  #|   if (!globalThis.__rl) {
+  #|     globalThis.__rl = {
+  #|       reader: Deno.stdin.readable.pipeThrough(new TextDecoderStream()).getReader(),
+  #|       pending: "",
+  #|     };
+  #|   }
+  #|   const st = globalThis.__rl;
+  #|   (async () => {
+  #|     for (;;) {
+  #|       const nl = st.pending.indexOf("\n");
+  #|       if (nl >= 0) {
+  #|         const line = st.pending.slice(0, nl);
+  #|         st.pending = st.pending.slice(nl + 1);
+  #|         cb(line);
+  #|         return;
+  #|       }
+  #|       const r = await st.reader.read();
+  #|       if (r.done) {
+  #|         const rest = st.pending;
+  #|         st.pending = "";
+  #|         if (rest) cb(rest); else eof();
+  #|         return;
+  #|       }
+  #|       st.pending += r.value;
+  #|     }
+  #|   })();
+  #| }
+
+///|
 /// Decode a raw safetensors payload to a Float32Array without the js
 /// backend's 2^27-element cap on MoonBit FixedArray (lm_head is 155M).
 extern "js" fn st_convert(
@@ -179,68 +214,63 @@ fn alloc_act(g : @gpu.Gpu, rows : Int) -> GPUAct {
 }
 
 ///|
-/// Transformer layer on `rows` tokens; k/v rows are appended at cache
-/// offset `cache_pos` (== pos0). Prefill: GEMM path; decode (rows=1): GEMV.
+///| Prefill layer (GEMM path; decode uses decode_layer). `rows` is the
+///| bucketed row count (next pow2 >= prompt len) so shape-baked pipeline
+///| keys (gemm/rope/embed/add/silu) don't recompile per prompt length.
+///| zp is a permanently-zero u32 params buffer: prefill attention/rope
+///| always start at cache position 0 (never the decode pos buffer).
 fn layer(
   g : @gpu.Gpu,
   m : Model,
   li : Int,
   x : GPUAct,
-  cache_pos : Int,
-  pos0 : @gpu.GPUBuffer,
+  rows : Int,
+  zp : @gpu.GPUBuffer,
   cost : @gpu.GPUBuffer,
   sint : @gpu.GPUBuffer,
 ) -> Unit {
-  let s = x.rows
+  let s = rows
   let nq = NQH * HD
   let nkv = NKH * HD
   g.rmsnorm(x.x, m.w["in\{li}"], x.xn, s, HID, EPS)
-  if s == 1 {
-    g.matvec(m.w["q\{li}"], x.xn, x.qq, nq, HID)
-    g.matvec(m.w["k\{li}"], x.xn, x.kk, nkv, HID)
-    g.matvec(m.w["v\{li}"], x.xn, x.vv, nkv, HID)
-  } else {
-    g.matmul(x.xn, m.w["q\{li}"], x.qq, s, nq, HID)
-    g.matmul(x.xn, m.w["k\{li}"], x.kk, s, nkv, HID)
-    g.matmul(x.xn, m.w["v\{li}"], x.vv, s, nkv, HID)
-  }
+  g.matmul(x.xn, m.w["q\{li}"], x.qq, s, nq, HID)
+  g.matmul(x.xn, m.w["k\{li}"], x.kk, s, nkv, HID)
+  g.matmul(x.xn, m.w["v\{li}"], x.vv, s, nkv, HID)
   g.rmsnorm(x.qq, m.w["qn\{li}"], x.qq, s * NQH, HD, EPS)
   g.rmsnorm(x.kk, m.w["kn\{li}"], x.kk, s * NKH, HD, EPS)
-  g.rope(x.qq, cost, sint, pos0, s, NQH, HD / 2)
-  g.rope(x.kk, cost, sint, pos0, s, NKH, HD / 2)
-  g.copy(x.kk, 0, m.kc[li], cache_pos * nkv, s * nkv)
-  g.copy(x.vv, 0, m.vc[li], cache_pos * nkv, s * nkv)
+  g.rope(x.qq, cost, sint, zp, s, NQH, HD / 2)
+  g.rope(x.kk, cost, sint, zp, s, NKH, HD / 2)
+  g.copy(x.kk, 0, m.kc[li], 0, s * nkv)
+  g.copy(x.vv, 0, m.vc[li], 0, s * nkv)
   g.attn_rows(
     x.qq,
     m.kc[li],
     m.vc[li],
     x.attn,
-    pos0,
+    zp,
     s,
     NQH,
     NKH,
     HD,
     MAXPOS,
   )
-  if s == 1 {
-    g.matvec(m.w["o\{li}"], x.attn, x.proj, HID, nq)
-  } else {
-    g.matmul(x.attn, m.w["o\{li}"], x.proj, s, HID, nq)
-  }
+  g.matmul(x.attn, m.w["o\{li}"], x.proj, s, HID, nq)
   g.add(x.x, x.proj, s * HID)
   g.rmsnorm(x.x, m.w["pn\{li}"], x.xn, s, HID, EPS)
-  if s == 1 {
-    g.matvec(m.w["gate\{li}"], x.xn, x.gb, INTER, HID)
-    g.matvec(m.w["up\{li}"], x.xn, x.ub, INTER, HID)
-    g.silu_mul(x.gb, x.ub, x.gb, INTER)
-    g.matvec(m.w["down\{li}"], x.gb, x.mlpb, HID, INTER)
-  } else {
-    g.matmul(x.xn, m.w["gate\{li}"], x.gb, s, INTER, HID)
-    g.matmul(x.xn, m.w["up\{li}"], x.ub, s, INTER, HID)
-    g.silu_mul(x.gb, x.ub, x.gb, s * INTER)
-    g.matmul(x.gb, m.w["down\{li}"], x.mlpb, s, HID, INTER)
-  }
+  g.matmul(x.xn, m.w["gate\{li}"], x.gb, s, INTER, HID)
+  g.matmul(x.xn, m.w["up\{li}"], x.ub, s, INTER, HID)
+  g.silu_mul(x.gb, x.ub, x.gb, s * INTER)
+  g.matmul(x.gb, m.w["down\{li}"], x.mlpb, s, HID, INTER)
   g.add(x.x, x.mlpb, s * HID)
+}
+
+///| Next power of two >= s (min 8) — pipeline-key bucketing for prefill.
+fn bucket(s : Int) -> Int {
+  let mut b = 8
+  while b < s {
+    b = b * 2
+  }
+  b
 }
 
 ///|
@@ -428,6 +458,8 @@ fn run(g : @gpu.Gpu) -> Unit raise Error {
   let (cost, sint) = rope_tables(g)
   let pos0b = g.alloc_u32()
   g.set_u32(pos0b, 0)
+  let zp = g.alloc_u32()
+  g.set_u32(zp, 0)
   g.sync(fn(_) { () })
   post("weights uploaded: \{(now_ms() - t0).to_int()} ms")
   // prompt: tokenize with our own BPE; assert it reproduces the HF ids
@@ -456,24 +488,18 @@ fn run(g : @gpu.Gpu) -> Unit raise Error {
   post("prompt: \{ids.length()} tokens (self-tokenized, matches HF ids)")
   let s = ids.length()
   let logits = g.alloc(VOCAB)
-  // prefill: one batched encoder for embeds + 28 layers + lm_head
-  let act = alloc_act(g, s)
-  let tp = now_ms()
-  g.begin()
-  let ids_buf = g.upload_u32(ids)
-  g.embed_rows(model.w["embed"], ids_buf, act.x, s, HID)
-  for li in 0..<NL {
-    layer(g, model, li, act, 0, pos0b, cost, sint)
-  }
-  // final norm on last position + tied lm_head
+  let act = alloc_act(g, MAXPOS)
   let xl = g.alloc(HID)
-  g.copy(act.x, (s - 1) * HID, xl, 0, HID)
-  g.rmsnorm(xl, model.w["norm"], xl, 1, HID, EPS)
-  g.matvec(model.w["embed"], xl, logits, VOCAB, HID)
-  g.flush()
+  let tok_buf = g.alloc_u32()
+  // argmax scratch: 594 workgroup partials + 1-float output
+  let am_v = g.alloc(594)
+  let am_i = g.alloc(594)
+  let am_o = g.alloc(1)
+  // correctness gate: prefill the HF reference prompt, compare logits
+  let tp = now_ms()
+  prefill(g, model, ids, act, xl, zp, cost, sint, logits)
   g.readback(logits, VOCAB, fn(got) {
     post("prefill \{s} tokens: \{(now_ms() - tp).to_int()} ms")
-    // compare with HF reference logits
     let refb = deno_read("refs/qwen3-0.6b/ref_logits.f32")
     let mut max_diff : Double = 0.0
     for i in 0..<VOCAB {
@@ -489,19 +515,112 @@ fn run(g : @gpu.Gpu) -> Unit raise Error {
       post("MATCH")
     } else {
       post("MISMATCH")
+      return
     }
-    // greedy decode a few tokens
-    let dact = alloc_act(g, 1)
-    let tok_buf = g.alloc_u32()
-    // argmax scratch: 594 workgroup partials + 1-float output
-    let am_v = g.alloc(594)
-    let am_i = g.alloc(594)
-    let am_o = g.alloc(1)
+    // sample decode of the gate prompt, then drop into the REPL
     decode_step(
-      g, model, dact, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, tk,
-      am, s, 32, [], now_ms(),
+      g, model, act, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, tk,
+      am, s, 16, [], now_ms(), true, fn() {
+        chat(g, model, tk, act, xl, zp, pos0b, cost, sint, tok_buf, logits, am_v, am_i, am_o)
+      },
     )
   })
+}
+
+///|
+/// Qwen3 chat template (non-thinking), specials spliced as raw ids.
+fn template_ids(tk : @qwen3.Tokenizer, q : String) -> Array[Int] raise Error {
+  let out : Array[Int] = [151644] // <|im_start|>
+  out.append(tk.encode("user\n" + q))
+  out.push(151645) // <|im_end|>
+  out.append(tk.encode("\n"))
+  out.push(151644)
+  out.append(tk.encode("assistant\n"))
+  out
+}
+
+///|
+/// Batched prefill: embeds + NL layers + final norm + lm_head → logits.
+fn prefill(
+  g : @gpu.Gpu,
+  model : Model,
+  ids : Array[Int],
+  act : GPUAct,
+  xl : @gpu.GPUBuffer,
+  zp : @gpu.GPUBuffer,
+  cost : @gpu.GPUBuffer,
+  sint : @gpu.GPUBuffer,
+  logits : @gpu.GPUBuffer,
+) -> Unit {
+  let s = ids.length()
+  let sb = bucket(s)
+  let ids_buf = g.upload_u32(ids)
+  g.begin()
+  g.embed_rows(model.w["embed"], ids_buf, act.x, sb, HID)
+  for li in 0..<NL {
+    layer(g, model, li, act, sb, zp, cost, sint)
+  }
+  g.copy(act.x, (s - 1) * HID, xl, 0, HID)
+  g.rmsnorm(xl, model.w["norm"], xl, 1, HID, EPS)
+  g.matvec(model.w["embed"], xl, logits, VOCAB, HID)
+  g.flush()
+}
+
+///|
+/// Interactive REPL: read a line, prefill the chat-templated prompt, greedy
+/// decode up to 256 tokens (EOS stops early), print, loop.
+fn chat(
+  g : @gpu.Gpu,
+  model : Model,
+  tk : @qwen3.Tokenizer,
+  act : GPUAct,
+  xl : @gpu.GPUBuffer,
+  zp : @gpu.GPUBuffer,
+  pos0b : @gpu.GPUBuffer,
+  cost : @gpu.GPUBuffer,
+  sint : @gpu.GPUBuffer,
+  tok_buf : @gpu.GPUBuffer,
+  logits : @gpu.GPUBuffer,
+  am_v : @gpu.GPUBuffer,
+  am_i : @gpu.GPUBuffer,
+  am_o : @gpu.GPUBuffer,
+) -> Unit {
+  print_raw("\n>>> ")
+  read_line(fn(line) {
+    if line == "quit" || line == "exit" {
+      post("bye")
+      return
+    }
+    let again = fn() {
+      chat(g, model, tk, act, xl, zp, pos0b, cost, sint, tok_buf, logits, am_v, am_i, am_o)
+    }
+    if line.trim() == "" {
+      again()
+      return
+    }
+    let ids = template_ids(tk, line) catch {
+      e => {
+        post("tokenize error: \{e}")
+        again()
+        return
+      }
+    }
+    if ids.length() > MAXPOS - 300 {
+      post("prompt too long (\{ids.length()} tokens)")
+      again()
+      return
+    }
+    let tp = now_ms()
+    prefill(g, model, ids, act, xl, zp, cost, sint, logits)
+    g.readback(logits, VOCAB, fn(got) {
+      post("[prefill \{ids.length()} tok: \{(now_ms() - tp).to_int()} ms]")
+      let am = argmax(got)
+      decode_step(
+        g, model, act, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, tk,
+        am, ids.length(), 256, [], now_ms(), false, again,
+      )
+    })
+  }, fn() { post("bye") })
 }
 
 ///|
@@ -524,15 +643,19 @@ fn decode_step(
   remaining : Int,
   out : Array[Int],
   t0 : Double,
+  verbose : Bool,
+  done : () -> Unit,
 ) -> Unit {
   if remaining == 0 || (cur == 151643 || cur == 151645) {
     let dt = now_ms() - t0
-    post(
-      "decode \{out.length()} tokens: \{dt.to_int()} ms (\{(dt / out.length().to_double()).to_int()} ms/tok)",
-    )
+    if out.length() > 0 {
+      post(
+        "[decode \{out.length()} tok: \{dt.to_int()} ms (\{(dt / out.length().to_double()).to_int()} ms/tok)]",
+      )
+    }
     let text = tk.decode(out) catch { _ => "<decode error>" }
     post("text: \"\{text}\"")
-    post("done")
+    done()
     return
   }
   let ts = now_ms()
@@ -549,11 +672,13 @@ fn decode_step(
   g.flush()
   let te = now_ms()
   g.argmax(logits, VOCAB, am_v, am_i, am_o, fn(am) {
-    post("step pos=\{pos}: encode=\{(te - ts).to_int()}ms total=\{(now_ms() - ts).to_int()}ms")
+    if verbose {
+      post("step pos=\{pos}: encode=\{(te - ts).to_int()}ms total=\{(now_ms() - ts).to_int()}ms")
+    }
     out.push(am)
     decode_step(
       g, model, act, cost, sint, pos0b, tok_buf, logits, am_v, am_i, am_o, tk,
-      am, pos + 1, remaining - 1, out, t0,
+      am, pos + 1, remaining - 1, out, t0, verbose, done,
     )
   })
 }
