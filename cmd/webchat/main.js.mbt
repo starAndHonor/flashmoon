@@ -29,6 +29,24 @@ extern "js" fn ui_status(s : String) -> Unit =
   #|(s) => { document.getElementById('status').textContent = s; }
 
 ///|
+extern "js" fn ui_answer_begin() -> Unit =
+  #|() => {
+  #|  const d = document.createElement('div');
+  #|  d.className = 'answer';
+  #|  document.getElementById('log').appendChild(d);
+  #|  globalThis.__answer = d;
+  #|}
+
+///|
+extern "js" fn ui_answer_append(s : String) -> Unit =
+  #|(s) => {
+  #|  if (!globalThis.__answer) return;
+  #|  globalThis.__answer.textContent += s;
+  #|  const log = document.getElementById('log');
+  #|  log.scrollTop = log.scrollHeight;
+  #|}
+
+///|
 extern "js" fn ui_enable() -> Unit =
   #|() => {
   #|  document.getElementById('in').disabled = false;
@@ -65,9 +83,9 @@ fn main {
         busy.val = true
         ui_log(">>> " + text)
         ui_status("generating…")
-        r.ask(text, 256, fn(answer, pms, dms, n) {
+        ui_answer_begin()
+        r.ask(text, 256, ui_answer_append, fn(_, pms, dms, n) {
           busy.val = false
-          ui_log(answer)
           ui_status(
             "prefill \{pms} ms · decode \{dms} ms · \{n} tok (\{if n > 0 { dms / n } else { 0 }} ms/tok)",
           )

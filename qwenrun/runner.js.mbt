@@ -440,6 +440,8 @@ fn decode_step(
   pos : Int,
   remaining : Int,
   out : Array[Int],
+  sd : @qwen3.StreamDecoder,
+  on_token : (String) -> Unit,
   t0 : Double,
   verbose : Bool,
   done : (String, Int) -> Unit,
@@ -470,23 +472,30 @@ fn decode_step(
       )
     }
     out.push(am)
-    decode_step(r, am, pos + 1, remaining - 1, out, t0, verbose, done)
+    let piece = sd.push(am) catch { _ => "" }
+    if piece != "" {
+      on_token(piece)
+    }
+    decode_step(r, am, pos + 1, remaining - 1, out, sd, on_token, t0, verbose, done)
   })
 }
 
 ///|
 /// Greedy decode `max` tokens starting from `first` at position `pos`
-/// (stops early at <|endoftext|>/<|im_end|>). on_done(text, n_tokens, ms).
+/// (stops early at <|endoftext|>/<|im_end|>). on_token fires with
+/// UTF-8-safe incremental text; on_done(text, n_tokens, ms).
 pub fn Runner::decode_greedy(
   self : Runner,
   first : Int,
   pos : Int,
   max : Int,
   verbose : Bool,
+  on_token : (String) -> Unit,
   on_done : (String, Int, Int) -> Unit,
 ) -> Unit {
   let t0 = now_ms()
-  decode_step(self, first, pos, max, [], t0, verbose, fn(text, n) {
+  let sd = @qwen3.StreamDecoder::new(self.tk)
+  decode_step(self, first, pos, max, [], sd, on_token, t0, verbose, fn(text, n) {
     on_done(text, n, (now_ms() - t0).to_int())
   })
 }
@@ -499,6 +508,7 @@ pub fn Runner::ask(
   self : Runner,
   user : String,
   max : Int,
+  on_token : (String) -> Unit,
   on_done : (String, Int, Int, Int) -> Unit,
 ) -> Unit {
   let ids = template_ids(self.tk, user) catch {
@@ -516,7 +526,7 @@ pub fn Runner::ask(
   self.readback_logits(fn(got) {
     let pms = (now_ms() - tp).to_int()
     let am = argmax(got)
-    self.decode_greedy(am, ids.length(), max, false, fn(text, n, dms) {
+    self.decode_greedy(am, ids.length(), max, false, on_token, fn(text, n, dms) {
       on_done(text, pms, dms, n)
     })
   })

@@ -106,7 +106,7 @@ fn gate(r : @qwenrun.Runner) -> Unit raise Error {
       return
     }
     // sample decode of the gate prompt, then drop into the REPL
-    r.decode_greedy(am, ids.length(), 16, true, fn(text, n, ms) {
+    r.decode_greedy(am, ids.length(), 16, true, fn(_) { () }, fn(text, n, ms) {
       post("[decode \{n} tok: \{ms} ms]")
       post("text: \"\{text}\"")
       repl(r)
@@ -126,9 +126,11 @@ fn repl(r : @qwenrun.Runner) -> Unit {
       repl(r)
       return
     }
-    r.ask(line, 256, fn(text, pms, dms, n) {
+    let t0 = now_ms()
+    r.ask(line, 256, print_raw, fn(_, pms, dms, n) {
+      ignore(t0)
+      post("")
       post("[\{pms}ms prefill / \{dms}ms decode, \{n} tok]")
-      post("text: \"\{text}\"")
       repl(r)
     })
   }, fn() { post("bye") })

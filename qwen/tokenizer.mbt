@@ -308,19 +308,61 @@ pub fn Tokenizer::encode(self : Tokenizer, text : String) -> Array[Int] raise {
 pub fn Tokenizer::decode(self : Tokenizer, ids : Array[Int]) -> String raise {
   let bytes : Array[Byte] = []
   for id in ids {
-    guard id >= 0 && id < self.id_to_tok.length() else { fail("bad id \{id}") }
-    let tok = self.id_to_tok[id]
-    if tok.has_prefix("<|") && tok.has_suffix("|>") {
-      continue // skip special tokens
-    }
-    for c in tok {
-      match self.char_to_byte.get(c) {
-        Some(b) => bytes.push(b.to_byte())
-        None => ()
-      }
-    }
+    bytes.append(self.token_bytes(id))
   }
   @utf8.decode_lossy(Bytes::from_array(bytes)[:])
+}
+
+///|
+/// Raw bytes of one token (special tokens map to nothing).
+pub fn Tokenizer::token_bytes(self : Tokenizer, id : Int) -> Array[Byte] raise {
+  guard id >= 0 && id < self.id_to_tok.length() else { fail("bad id \{id}") }
+  let tok = self.id_to_tok[id]
+  let out : Array[Byte] = []
+  if tok.has_prefix("<|") && tok.has_suffix("|>") {
+    return out // skip special tokens
+  }
+  for c in tok {
+    match self.char_to_byte.get(c) {
+      Some(b) => out.push(b.to_byte())
+      None => ()
+    }
+  }
+  out
+}
+
+///|
+/// Incremental UTF-8-safe decoder for streaming generation: multi-byte
+/// characters split across tokens are held back until complete. A literal
+/// U+FFFD stored in the vocab is indistinguishable from an incomplete tail
+/// and would be held back forever (accepted edge case).
+pub struct StreamDecoder {
+  tk : Tokenizer
+  buf : Array[Byte]
+  mut shown : Int // chars already emitted
+}
+
+///|
+pub fn StreamDecoder::new(tk : Tokenizer) -> StreamDecoder {
+  { tk, buf: [], shown: 0 }
+}
+
+///|
+/// Append one token; returns the newly-completed text ("" while a UTF-8
+/// sequence is still incomplete).
+pub fn StreamDecoder::push(self : StreamDecoder, id : Int) -> String raise {
+  self.buf.append(self.tk.token_bytes(id))
+  let cs = @utf8.decode_lossy(Bytes::from_array(self.buf)[:]).to_array()
+  let mut safe = cs.length()
+  while safe > self.shown && cs[safe - 1] == '\u{FFFD}' {
+    safe -= 1
+  }
+  if safe == self.shown {
+    return ""
+  }
+  let out = String::from_array(cs[self.shown:safe].iter().collect())
+  self.shown = safe
+  out
 }
 
 ///|
@@ -330,4 +372,31 @@ test "decode round-trips byte-level tokens" {
     #|{"model":{"vocab":{"Ġhello":1,"Ċ":2,"a":0},"merges":[]}}
   let t = Tokenizer::load(json)
   assert_eq(t.decode([1, 0, 2]), " helloa\n")
+}
+
+///|
+test "StreamDecoder holds incomplete UTF-8" {
+  let t = byte_to_unicode()
+  // token a = bytes [E4 B8] (first two of 中), token b = [AD]
+  let ta = String::from_array([t[0xE4], t[0xB8]])
+  let tb = String::from_array([t[0xAD]])
+  let json = (
+    $|{"model":{"vocab":{"\{ta}":0,"\{tb}":1,"a":2,"<|x|>":3},"merges":[]},
+    $| "added_tokens":[{"id":3,"content":"<|x|>"}]}
+  )
+  let tk = Tokenizer::load(json)
+  let sd = StreamDecoder::new(tk)
+  assert_eq(sd.push(0), "") // E4 B8 alone is incomplete
+  assert_eq(sd.push(1), "中")
+  assert_eq(sd.push(2), "a")
+  assert_eq(sd.push(3), "") // special token: no output
+}
+
+///|
+test "StreamDecoder plain ascii streams" {
+  let json = #|{"model":{"vocab":{"he":0,"llo":1},"merges":[]}}
+  let tk = Tokenizer::load(json)
+  let sd = StreamDecoder::new(tk)
+  assert_eq(sd.push(0), "he")
+  assert_eq(sd.push(1), "llo")
 }
