@@ -10,6 +10,9 @@
   #log div { margin: .25rem 0; }
   #cfg { display: flex; gap: .75rem; align-items: center; margin-top: .5rem; font-size: 12px; color: #555; }
   #cfg input { width: 4.5rem; padding: .2rem; }
+  #cfg label { display: flex; gap: .3rem; align-items: center; }
+  #cfg input[type=range] { width: 8rem; padding: 0; }
+  #cfg output { min-width: 2.5rem; font-family: ui-monospace, monospace; }
   #bar { display: flex; gap: .5rem; margin-top: .75rem; }
   #in { flex: 1; padding: .5rem; }
 </style>
@@ -21,10 +24,17 @@
   <button id="send" disabled>Send</button>
 </div>
 <div id="cfg">
-  max <input id="cfg_max" type="number" value="256" min="1" max="1800">
-  temp <input id="cfg_temp" type="number" value="0" step="0.1" min="0" max="2">
-  top-k <input id="cfg_topk" type="number" value="1" min="0" max="100">
-  top-p <input id="cfg_topp" type="number" value="1" step="0.05" min="0" max="1">
+  <label>max <input id="cfg_max" type="range" min="16" max="1800" step="16" value="256"><output for="cfg_max">256</output></label>
+  <label>temp <input id="cfg_temp" type="range" min="0" max="2" step="0.05" value="0"><output for="cfg_temp">0</output></label>
+  <label>top-k <input id="cfg_topk" type="range" min="0" max="200" step="1" value="1"><output for="cfg_topk">1</output></label>
+  <label>top-p <input id="cfg_topp" type="range" min="0" max="1" step="0.01" value="1"><output for="cfg_topp">1</output></label>
   <span style="color:#888">temp 0 = greedy</span>
 </div>
+<script>
+  // live value labels next to each slider
+  for (const o of document.querySelectorAll('#cfg output')) {
+    const inp = document.getElementById(o.htmlFor);
+    inp.oninput = () => { o.textContent = inp.value; };
+  }
+</script>
 <script src="../../_build/js/debug/build/cmd/webchat/webchat.js"></script>
