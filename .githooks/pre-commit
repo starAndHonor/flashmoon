@@ -1,3 +1,4 @@
 #!/bin/sh
-
-moon check
+# js covers gpu/ + cmd/web (WebGPU FFI); wasm-gc/native cover the pure
+# flash-attention library and its SIMD kernels.
+moon check --target js && moon check --target wasm-gc && moon check --target native

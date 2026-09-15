@@ -1,0 +1,12 @@
+import {
+  "chnlkw/moonxi-net" @tensor,
+  "chnlkw/moonxi-net/nparray",
+}
+
+options(
+  targets: {
+    "attention.mbt": [ "js" ],
+    "shader.mbt": [ "js" ],
+    "webgpu.mbt": [ "js" ],
+  },
+)
