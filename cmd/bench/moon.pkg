@@ -1,0 +1,8 @@
+import {
+  "starAndHonor/flashmoon",
+  "chnlkw/moonxi-net" @tensor,
+  "chnlkw/moonxi-net/nparray",
+  "moonbitlang/core/bench" @cbench,
+}
+
+pkgtype(kind: "executable")
