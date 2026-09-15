@@ -19,3 +19,31 @@ deno run --allow-read scripts/webgpu_host.js
 
 Measured on RTX 4060 Laptop (4096×4096, d=dv=64): kernels+copy ≈ 13ms
 (~330 GFLOP/s), max_diff ≈ 2.4e-7 vs the CPU naive kernel.
+
+## Qwen3-0.6B chat (WebGPU)
+
+Full-model inference (`qwenrun` package: tokenizer, prefill GEMM path, fused
+decode kernels, bf16 weights GPU-resident), verified against HF reference
+logits (max_diff ≈ 4e-5).
+
+Deno REPL (headless, real GPU via wgpu/Vulkan):
+
+```sh
+moon build --target js
+deno run --allow-read scripts/qwengpu_host.js
+```
+
+Browser page (needs WebGPU flags on Linux Chrome):
+
+```sh
+moon build --target js
+python3 -m http.server 8123   # repo root
+chromium --enable-unsafe-webgpu --enable-features=Vulkan,WebGPUService,WebGPU \
+  --use-webgpu-adapter=vulkan \
+  http://127.0.0.1:8123/cmd/webchat/chat.html
+```
+
+Measured on RTX 4060 Laptop: prefill ~300 ms (short prompts), decode
+~11 ms/tok in Chrome/Dawn (~30 ms/tok under Deno/wgpu). Chrome rejects
+writable-storage binding aliasing that wgpu tolerates — all dispatches are
+alias-free (single-binding in-place or out-of-place).

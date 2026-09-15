@@ -1,9 +1,6 @@
 import {
   "starAndHonor/flashmoon/gpu",
   "starAndHonor/flashmoon/qwenrun",
-  "starAndHonor/flashmoon/qwen" @qwen3,
-  "moonbitlang/core/math",
-  "moonbitlang/core/json",
 }
 
 pkgtype(kind: "executable")

@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flashmoon — Qwen3-0.6B on WebGPU</title>
+<style>
+  body { font: 14px/1.55 system-ui, sans-serif; max-width: 840px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; }
+  #status { color: #666; margin: .5rem 0; font-family: ui-monospace, monospace; font-size: 12px; }
+  #log { white-space: pre-wrap; border: 1px solid #ccc; border-radius: 6px; padding: 1rem; height: 60vh; overflow-y: auto; }
+  #log div { margin: .25rem 0; }
+  #bar { display: flex; gap: .5rem; margin-top: .75rem; }
+  #in { flex: 1; padding: .5rem; }
+</style>
+<h1>flashmoon — Qwen3-0.6B chat (WebGPU, MoonBit)</h1>
+<div id="status">booting…</div>
+<div id="log"></div>
+<div id="bar">
+  <input id="in" disabled placeholder="Ask something… (Enter to send)">
+  <button id="send" disabled>Send</button>
+</div>
+<script src="../../_build/js/debug/build/cmd/webchat/webchat.js"></script>
