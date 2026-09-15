@@ -1,0 +1,12 @@
+import {
+  "starAndHonor/flashmoon/qwen" @qwen3,
+  "moonbitlang/x/fs",
+  "moonbitlang/core/json",
+  "moonbitlang/core/env",
+}
+
+pkgtype(kind: "executable")
+
+options(
+  targets: { "main.mbt": [ "native" ] },
+)

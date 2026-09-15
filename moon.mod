@@ -27,4 +27,5 @@ description = ""
 
 import {
   "chnlkw/moonxi-net@0.1.1",
+  "moonbitlang/x@0.5.5",
 }
