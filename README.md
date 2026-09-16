@@ -2,9 +2,9 @@
 
 # ⚡ flashmoon
 
-**FlashAttention-2 & full LLM inference, written in pure MoonBit, running on your GPU via WebGPU.**
+**FlashAttention-style attention & full LLM inference, written in pure MoonBit, running on your GPU via WebGPU.**
 
-纯 MoonBit 实现的 FlashAttention-2 与端到端大模型推理——从 wasm 到浏览器里的真实 GPU。
+纯 MoonBit 实现的 FlashAttention 式分块注意力与端到端大模型推理——从 wasm 到浏览器里的真实 GPU。
 
 [![MoonBit](https://img.shields.io/badge/language-MoonBit-blue)](https://www.moonbitlang.com)
 [![WebGPU](https://img.shields.io/badge/backend-WebGPU-005a9c)](https://www.w3.org/TR/webgpu/)
@@ -36,9 +36,9 @@ Measured on an RTX 4060 Laptop (release build, Qwen3-0.6B, short prompts):
 |---|---|---|---|
 | **Chromium (WebGPU)** | ~300–410 ms | **~11 ms/tok (~90 tok/s)** greedy | ~36 ms/tok sampling (logits readback) |
 | **Deno (WebGPU)** | ~350 ms | ~20 ms/tok greedy | second WGSL→Vulkan adapter layer |
-| FlashAttention-2 kernel | — | **318 GFLOP/s** | 4096×4096, d=64, dispatch-only |
+| Tiled attention (WebGPU) | — | **318 GFLOP/s** | 4096×4096, d=64, dispatch-only |
 | GEMV 151936×1024 bf16 | — | **2.7 ms (116 GB/s)** | dispatch-only |
-| wasm FA2 (f32x4 SIMD) | — | ~5.4 ms | 256×256, d=64, native-wasm |
+| wasm tiled attention (f32x4 SIMD) | — | ~5.4 ms | 256×256, d=64, native-wasm |
 
 ## Quick start
 
@@ -75,12 +75,12 @@ deno run --allow-read scripts/qwengpu_host.js
 deno run --allow-read scripts/webgpu_host.js
 ```
 
-**🧊 FlashAttention-2 on wasm/native** (no GPU needed)
+**🧊 FlashAttention on wasm/native** (no GPU needed)
 
 ```bash
 moon test                                  # full suite, incl. tokenizer oracle
 moon run cmd/fa --target wasm              # naive vs flash demo
-moon run cmd/bench --target wasm --release # FA2 benchmark harness
+moon run cmd/bench --target wasm --release # attention benchmark harness
 ```
 
 ## Architecture
@@ -100,12 +100,20 @@ flowchart LR
     B & D --> R --> G
     K --> G
     R --> Q
-    W["FlashAttention-2<br/>root package (wasm/native)"]
+    W["Tiled flash attention<br/>root package (wasm/native)"]
 ```
 
 Decode-critical invariants: f32-resident KV cache, RoPE fused on write, in-place
 SiLU+residual, single-submit argmax — **only logits-per-token and final text
 cross the GPU↔CPU boundary**.
+
+> **On the name.** The scalar kernel implements the FlashAttention-family
+> algorithm — tiled online softmax with running max/sum — and keeps the
+> FA2-style deferred `1/l` normalization (the accumulator is divided once, at
+> the end). FA2's headline contributions are CUDA grid/warp scheduling
+> (Q-parallel thread blocks, per-warp Q partitioning), which don't translate
+> to a scalar wasm kernel. The GPU decode path is *flash-decoding* (KV split
+> across workgroups), the correct variant for q=1 decode.
 
 ## Verification
 
@@ -114,7 +122,7 @@ cross the GPU↔CPU boundary**.
 | Greedy logits, GPU vs CPU reference | **byte-exact MATCH** |
 | Kernel unit checks (rmsnorm / rope / silu+add / attn_rows) | max diff ≤ 1.2e-7 |
 | Tokenizer vs HuggingFace oracle | exact ID match |
-| FA2 wasm vs naive attention | max diff ≤ 5e-5 |
+| wasm tiled attention vs naive attention | max diff ≤ 5e-5 |
 | bf16 storage vs byte loads | equal (exposed byte/bf16 rounding drift, now read-side converted) |
 
 The Deno REPL's MATCH gate compares the first token ID against the CPU
@@ -123,12 +131,12 @@ reference on every startup — regressions fail loudly.
 ## Repository layout
 
 ```
-flashmoon.mbt / kernel_*.mbt   FlashAttention-2 (wasm/native, f32x4 SIMD) — root package
+flashmoon.mbt / kernel_*.mbt   tiled flash attention (wasm/native, f32x4 SIMD) — root package
 gpu/                           WebGPU runtime + compute kernels (js target)
 qwen/                          safetensors parser + Qwen2 byte-level BPE tokenizer
 qwenrun/                       Qwen3-0.6B runner core (host-agnostic: read/log injected)
-cmd/fa/                        FA2 naive-vs-flash demo (wasm/native)
-cmd/bench/                     FA2 benchmark harness (wasm)
+cmd/fa/                        naive-vs-flash attention demo (wasm/native)
+cmd/bench/                     attention benchmark harness (wasm)
 cmd/gpubench/                  WebGPU kernel checks + benchmarks (Deno host)
 cmd/qwencpu/                   Qwen3 CPU reference runner + tokenizer oracle test
 cmd/qwengpu/                   Deno REPL chat (MATCH gate + slash commands)
