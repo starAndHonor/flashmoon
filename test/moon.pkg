@@ -1,7 +1,7 @@
 // All tests for the module live here (blackbox). Whitebox tests that need
 // package internals stay next to their package as *_wbtest.mbt.
 import {
-  "starAndHonor/flashmoon",
+  "starAndHonor/flashmoon/flash",
   "starAndHonor/flashmoon/qwen",
   "chnlkw/moonxi-net" @tensor_test,
   "chnlkw/moonxi-net/nparray" @nparray_test,

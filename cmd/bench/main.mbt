@@ -133,16 +133,16 @@ fn sweep_seqlen(reps : Int) -> Unit {
   for s in [128, 256, 512, 1024, 2048, 4096] {
     let (q, k, v) = make_qkv(s, s, 64)
     let t_naive = timed_us(
-      fn() { @flashmoon.naive_attention(q, k, v) |> ignore },
+      fn() { @flash.naive_attention(q, k, v) |> ignore },
       reps,
     )
     let t_flash = timed_us(
-      fn() { @flashmoon.flash_attention(q, k, v) |> ignore },
+      fn() { @flash.flash_attention(q, k, v) |> ignore },
       reps,
     )
     let diff = max_abs_diff(
-      @flashmoon.naive_attention(q, k, v),
-      @flashmoon.flash_attention(q, k, v),
+      @flash.naive_attention(q, k, v),
+      @flash.flash_attention(q, k, v),
     )
     println(
       pad("\{s}x\{s}", 10) +
@@ -173,16 +173,16 @@ fn sweep_headdim(reps : Int) -> Unit {
   for d in [32, 64, 128] {
     let (q, k, v) = make_qkv(1024, 1024, d)
     let t_naive = timed_us(
-      fn() { @flashmoon.naive_attention(q, k, v) |> ignore },
+      fn() { @flash.naive_attention(q, k, v) |> ignore },
       reps,
     )
     let t_flash = timed_us(
-      fn() { @flashmoon.flash_attention(q, k, v) |> ignore },
+      fn() { @flash.flash_attention(q, k, v) |> ignore },
       reps,
     )
     let diff = max_abs_diff(
-      @flashmoon.naive_attention(q, k, v),
-      @flashmoon.flash_attention(q, k, v),
+      @flash.naive_attention(q, k, v),
+      @flash.flash_attention(q, k, v),
     )
     println(
       pad("\{d}", 8) +
@@ -208,14 +208,13 @@ fn sweep_blocksize(reps : Int) -> Unit {
     let (q, k, v) = make_qkv(2048, 2048, 64)
     let t_flash = timed_us(
       fn() {
-        @flashmoon.flash_attention(q, k, v, block_rows=b, block_cols=b)
-        |> ignore
+        @flash.flash_attention(q, k, v, block_rows=b, block_cols=b) |> ignore
       },
       reps,
     )
     let diff = max_abs_diff(
-      @flashmoon.naive_attention(q, k, v),
-      @flashmoon.flash_attention(q, k, v, block_rows=b, block_cols=b),
+      @flash.naive_attention(q, k, v),
+      @flash.flash_attention(q, k, v, block_rows=b, block_cols=b),
     )
     println(
       pad("\{b}x\{b}", 12) +

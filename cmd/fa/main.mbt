@@ -20,8 +20,8 @@ fn main {
   let q = mk(n, d, 0)
   let k = mk(m, d, 1)
   let v = mk(m, dv, 2)
-  let naive = @flashmoon.naive_attention(q, k, v)
-  let flash = @flashmoon.flash_attention(q, k, v, block_rows=16, block_cols=16)
+  let naive = @flash.naive_attention(q, k, v)
+  let flash = @flash.flash_attention(q, k, v, block_rows=16, block_cols=16)
   let da = naive.value().data
   let db = flash.value().data
   let mut max_diff = 0.0F

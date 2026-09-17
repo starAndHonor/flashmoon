@@ -1,5 +1,5 @@
 // Generated using `moon info`, DON'T EDIT IT
-package "starAndHonor/flashmoon"
+package "starAndHonor/flashmoon/flash"
 
 import {
   "chnlkw/moonxi-net/nparray",

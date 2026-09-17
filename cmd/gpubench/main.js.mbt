@@ -110,7 +110,7 @@ fn check_attention(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
   let outb = g.alloc(128 * 64)
   g.flash_attention(qb, kb, vb, outb, 128, 128, 64, 64)
   g.readback(outb, 128 * 64, fn(got) {
-    let want = @flashmoon.naive_attention(
+    let want = @flash.naive_attention(
       as_tensor(q, 128, 64),
       as_tensor(k, 128, 64),
       as_tensor(v, 128, 64),

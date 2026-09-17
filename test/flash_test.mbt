@@ -50,8 +50,8 @@ fn rand_qkv(
 ///|
 test "flash matches naive: non-divisible blocks" {
   let (q, k, v) = rand_qkv(37, 53, 16, 24)
-  let naive = @flashmoon.naive_attention(q, k, v)
-  let flash = @flashmoon.flash_attention(q, k, v, block_rows=8, block_cols=13)
+  let naive = @flash.naive_attention(q, k, v)
+  let flash = @flash.flash_attention(q, k, v, block_rows=8, block_cols=13)
   let diff = max_abs_diff(naive, flash)
   assert_true(diff < 1.0e-4, msg="max diff \{diff}")
 }
@@ -59,8 +59,8 @@ test "flash matches naive: non-divisible blocks" {
 ///|
 test "flash matches naive: blocks larger than matrix" {
   let (q, k, v) = rand_qkv(3, 5, 4, 6)
-  let naive = @flashmoon.naive_attention(q, k, v)
-  let flash = @flashmoon.flash_attention(q, k, v, block_rows=32, block_cols=32)
+  let naive = @flash.naive_attention(q, k, v)
+  let flash = @flash.flash_attention(q, k, v, block_rows=32, block_cols=32)
   let diff = max_abs_diff(naive, flash)
   assert_true(diff < 1.0e-4, msg="max diff \{diff}")
 }
@@ -68,8 +68,8 @@ test "flash matches naive: blocks larger than matrix" {
 ///|
 test "flash matches naive: 1x1 edge case" {
   let (q, k, v) = rand_qkv(1, 1, 2, 3)
-  let naive = @flashmoon.naive_attention(q, k, v)
-  let flash = @flashmoon.flash_attention(q, k, v, block_rows=1, block_cols=1)
+  let naive = @flash.naive_attention(q, k, v)
+  let flash = @flash.flash_attention(q, k, v, block_rows=1, block_cols=1)
   // single key: softmax degenerates to 1, output equals the single v row
   let expected = v.value().data
   let got = flash.value().data
@@ -87,7 +87,7 @@ test "zero scores give uniform average of v" {
   let q = make_tensor(n, 8, fn(_, _) { 0.0F })
   let k = make_tensor(m, 8, fn(_, _) { 0.0F })
   let v = make_tensor(m, dv, fn(i, j) { Float::from_int(i * dv + j) })
-  let out = @flashmoon.flash_attention(q, k, v, block_rows=2, block_cols=3)
+  let out = @flash.flash_attention(q, k, v, block_rows=2, block_cols=3)
   let data = out.value().data
   // every row must equal column means of v
   for i in 0..<n {

@@ -1,5 +1,5 @@
 import {
-  "starAndHonor/flashmoon",
+  "starAndHonor/flashmoon/flash",
   "chnlkw/moonxi-net" @tensor,
   "chnlkw/moonxi-net/nparray",
 }

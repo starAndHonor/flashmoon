@@ -26,33 +26,27 @@ fn bench_qkv(
 test "bench attention 512x512 d=64" (b : @bench.T) {
   let (q, k, v) = bench_qkv(512, 512, 64)
   let naive = fn() {
-    let out = @flashmoon.naive_attention(q, k, v)
+    let out = @flash.naive_attention(q, k, v)
     b.keep(out)
   }
   b.bench(name="naive", naive)
   let flash16 = fn() {
-    let out = @flashmoon.flash_attention(q, k, v, block_rows=16, block_cols=16)
+    let out = @flash.flash_attention(q, k, v, block_rows=16, block_cols=16)
     b.keep(out)
   }
   b.bench(name="flash b16", flash16)
   let flash32 = fn() {
-    let out = @flashmoon.flash_attention(q, k, v, block_rows=32, block_cols=32)
+    let out = @flash.flash_attention(q, k, v, block_rows=32, block_cols=32)
     b.keep(out)
   }
   b.bench(name="flash b32", flash32)
   let flash64 = fn() {
-    let out = @flashmoon.flash_attention(q, k, v, block_rows=64, block_cols=64)
+    let out = @flash.flash_attention(q, k, v, block_rows=64, block_cols=64)
     b.keep(out)
   }
   b.bench(name="flash b64", flash64)
   let flash128 = fn() {
-    let out = @flashmoon.flash_attention(
-      q,
-      k,
-      v,
-      block_rows=128,
-      block_cols=128,
-    )
+    let out = @flash.flash_attention(q, k, v, block_rows=128, block_cols=128)
     b.keep(out)
   }
   b.bench(name="flash b128", flash128)

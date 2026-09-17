@@ -130,7 +130,7 @@ reference on every startup — regressions fail loudly.
 ## Repository layout
 
 ```
-flashmoon.mbt / kernel_*.mbt   tiled flash attention (wasm/native, f32x4 SIMD) — root package
+flash/                         tiled flash attention (wasm/native, f32x4 SIMD) — the original kernel library
 gpu/                           WebGPU runtime + compute kernels (js target)
 qwen/                          safetensors parser + Qwen2 byte-level BPE tokenizer
 qwenrun/                       Qwen3-0.6B runner core (host-agnostic: read/log injected)
