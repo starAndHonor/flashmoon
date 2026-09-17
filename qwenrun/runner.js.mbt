@@ -88,7 +88,7 @@ struct Model {
 ///|
 fn upload(
   g : @gpu.Gpu,
-  st : @qwen3.SafeTensors,
+  st : @qwen.SafeTensors,
   name : String,
 ) -> @gpu.GPUBuffer raise Error {
   let (bytes, off, n, dtype) = st.raw(name)
@@ -100,7 +100,7 @@ fn upload(
 /// kernels unpack bf16 to the exact same f32 values as the CPU oracle).
 fn upload_w(
   g : @gpu.Gpu,
-  st : @qwen3.SafeTensors,
+  st : @qwen.SafeTensors,
   name : String,
 ) -> @gpu.GPUBuffer raise Error {
   let (bytes, off, n, dtype) = st.raw(name)
@@ -109,7 +109,7 @@ fn upload_w(
 }
 
 ///|
-fn load_model(g : @gpu.Gpu, st : @qwen3.SafeTensors) -> Model raise Error {
+fn load_model(g : @gpu.Gpu, st : @qwen.SafeTensors) -> Model raise Error {
   let w : Map[String, @gpu.GPUBuffer] = Map([])
   w["embed"] = upload_w(g, st, "model.embed_tokens.weight")
   w["norm"] = upload(g, st, "model.norm.weight")
@@ -331,7 +331,7 @@ pub fn argmax(logits : FixedArray[Float]) -> Int {
 
 ///|
 /// Qwen3 chat template (non-thinking), specials spliced as raw ids.
-fn template_ids(tk : @qwen3.Tokenizer, q : String) -> Array[Int] raise Error {
+fn template_ids(tk : @qwen.Tokenizer, q : String) -> Array[Int] raise Error {
   let out : Array[Int] = [151644] // <|im_start|>
   out.append(tk.encode("user\n" + q))
   out.push(151645) // <|im_end|>
@@ -346,7 +346,7 @@ fn template_ids(tk : @qwen3.Tokenizer, q : String) -> Array[Int] raise Error {
 pub struct Runner {
   g : @gpu.Gpu
   model : Model
-  tk : @qwen3.Tokenizer
+  tk : @qwen.Tokenizer
   log : (String) -> Unit
   act : GPUAct
   xl : @gpu.GPUBuffer
@@ -393,9 +393,9 @@ fn boot_from_bytes(
   log : (String) -> Unit,
 ) -> Runner raise Error {
   let t0 = now_ms()
-  let st = @qwen3.SafeTensors::parse(stb)
+  let st = @qwen.SafeTensors::parse(stb)
   let model = load_model(g, st)
-  let tk = @qwen3.Tokenizer::load(bytes_to_string(tjb))
+  let tk = @qwen.Tokenizer::load(bytes_to_string(tjb))
   let (cost, sint) = rope_tables(g)
   let pos0b = g.alloc_u32()
   g.set_u32(pos0b, 0)
@@ -550,7 +550,7 @@ fn decode_step(
   pos : Int,
   remaining : Int,
   out : Array[Int],
-  sd : @qwen3.StreamDecoder,
+  sd : @qwen.StreamDecoder,
   on_token : (String) -> Unit,
   sampler : Sampler,
   t0 : Double,
@@ -626,7 +626,7 @@ pub fn Runner::decode_greedy(
   on_done : (String, Int, Int) -> Unit,
 ) -> Unit {
   let t0 = now_ms()
-  let sd = @qwen3.StreamDecoder::new(self.tk)
+  let sd = @qwen.StreamDecoder::new(self.tk)
   decode_step(self, first, pos, max, [], sd, on_token, sampler, t0, verbose, fn(
     text,
     n,

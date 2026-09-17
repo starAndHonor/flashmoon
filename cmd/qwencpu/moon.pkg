@@ -1,5 +1,5 @@
 import {
-  "starAndHonor/flashmoon/qwen" @qwen3,
+  "starAndHonor/flashmoon/qwen",
   "moonbitlang/x/fs",
   "moonbitlang/core/json",
   "moonbitlang/core/env",

@@ -20,8 +20,8 @@ fn run() -> Unit raise Error {
     println("usage: qwen <model.safetensors> <ref_input.json> <ref_logits.f32>")
     panic()
   }
-  let st = @qwen3.SafeTensors::parse(@fs.read_file_to_bytes(args[1]))
-  let model = @qwen3.Qwen3::load(st)
+  let st = @qwen.SafeTensors::parse(@fs.read_file_to_bytes(args[1]))
+  let model = @qwen.Qwen3::load(st)
   println("weights loaded")
   // reference input tokens
   let input_json = @json.parse(@fs.read_file_to_string(args[2]))

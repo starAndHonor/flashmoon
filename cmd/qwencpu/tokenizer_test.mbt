@@ -16,7 +16,7 @@ fn refs_dir() -> String {
 
 ///|
 test "tokenizer encodes HF oracle cases exactly" {
-  let tok = @qwen3.Tokenizer::load(
+  let tok = @qwen.Tokenizer::load(
     @fs.read_file_to_string(refs_dir() + "/tokenizer.json"),
   )
   let cases : Json = @json.parse(

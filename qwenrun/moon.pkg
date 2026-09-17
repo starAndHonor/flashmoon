@@ -1,6 +1,6 @@
 import {
   "starAndHonor/flashmoon/gpu",
-  "starAndHonor/flashmoon/qwen" @qwen3,
+  "starAndHonor/flashmoon/qwen",
   "moonbitlang/core/math",
   "moonbitlang/core/json",
 }
