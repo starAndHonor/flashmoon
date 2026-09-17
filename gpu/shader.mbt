@@ -738,7 +738,7 @@ pub fn attn_decode_shader(
 /// output. One workgroup of hd threads per head (thread-per-dim): the
 /// cross-split online-softmax rescale w_s = exp(m_s - M), out = sum(w_s *
 /// acc_s) / sum(w_s * l_s). Grid: (hq, 1).
-pub fn attn_combine_shader(hq : Int, hd : Int, splits : Int) -> String {
+pub fn attn_combine_shader(hd : Int, splits : Int) -> String {
   let src =
     $|@group(0) @binding(0) var<storage, read> part : array<f32>;
     $|@group(0) @binding(1) var<storage, read_write> outp : array<f32>;

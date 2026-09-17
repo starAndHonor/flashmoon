@@ -482,7 +482,7 @@ pub fn Gpu::attn_decode(
   })
   self.run_pass(p1, [q, kc, vc, part, pos0], splits, hq)
   let p2 = self.pipeline("attnc:\{hq},\{hd}", fn() {
-    attn_combine_shader(hq, hd, splits)
+    attn_combine_shader(hd, splits)
   })
   self.run_pass(p2, [part, out], hq, 1)
 }
