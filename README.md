@@ -23,7 +23,7 @@
 
 - 🧮 **Numerics you can trust** — GPU greedy-decode logits are a **byte-exact MATCH** against the CPU reference runner; tokenizer verified against a HuggingFace-generated oracle. No silent drift anywhere in the stack.
 - 🚀 **bf16 end-to-end, zero copies** — weights upload as raw bytes; GEMV reads bf16 straight from storage buffers. Layer weights are written **in-place** during upload (no transient copies).
-- 🔥 **Hand-tuned WGSL kernels** — per-row attention with **KV split across 16 workgroups + f32x4 vectorized loads**, tiled flash-attention, fused SiLU·residual·RoPE, and a full-logit GPU argmax for greedy decode.
+- 🔥 **Hand-tuned WGSL kernels** — per-(row, head) attention with scores staged in workgroup SRAM, fused SiLU·residual·RoPE, bf16 GEMV, and a full-logit GPU argmax for greedy decode. Flash-style tiled kernels (online softmax, K/V shared-memory tiles) ship in `cmd/gpubench` but are not yet wired into the LLM path.
 - 🧱 **One runtime, every host** — the same `qwenrun` core runs in the browser (interactive page), Deno (REPL with a CI-friendly MATCH gate), wasm and native.
 - 🎛️ **Real generation controls** — max tokens / temperature / top-k / top-p sliders in the browser, slash commands in the REPL. Greedy path stays pure-GPU; sampling pays one logits readback.
 - 📦 **Zero-dependency core** — the entire GPU path is MoonBit code + WebGPU. No native libs, no Python, no ONNX.
@@ -107,13 +107,14 @@ Decode-critical invariants: f32-resident KV cache, RoPE fused on write, in-place
 SiLU+residual, single-submit argmax — **only logits-per-token and final text
 cross the GPU↔CPU boundary**.
 
-> **On the name.** The scalar kernel implements the FlashAttention-family
-> algorithm — tiled online softmax with running max/sum — and keeps the
-> FA2-style deferred `1/l` normalization (the accumulator is divided once, at
-> the end). FA2's headline contributions are CUDA grid/warp scheduling
-> (Q-parallel thread blocks, per-warp Q partitioning), which don't translate
-> to a scalar wasm kernel. The GPU decode path is *flash-decoding* (KV split
-> across workgroups), the correct variant for q=1 decode.
+> **On the name.** The repo contains FlashAttention-family kernels (tiled
+> online softmax, running max/sum, deferred `1/l` normalization): the wasm
+> root package and the WebGPU tiled kernel in `cmd/gpubench`. FA2's headline
+> contributions are CUDA grid/warp scheduling (Q-parallel thread blocks,
+> per-warp Q partitioning), which don't translate to these ports — so we
+> don't claim the name. The Qwen3 inference path itself currently uses a
+> simpler per-(row, head) kernel with scores staged in workgroup SRAM; wiring
+> the flash kernels into prefill/decode is future work.
 
 ## Verification
 
