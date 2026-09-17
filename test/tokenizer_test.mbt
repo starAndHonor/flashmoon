@@ -7,8 +7,8 @@
 /// (see gen_ref.py workflow).
 fn refs_dir() -> String {
   // moon test runs at the package dir; be robust to repo-root cwd too
-  if @fs.path_exists("../../refs/qwen3-0.6b/tokenizer_cases.json") {
-    "../../refs/qwen3-0.6b"
+  if @fs.path_exists("../refs/qwen3-0.6b/tokenizer_cases.json") {
+    "../refs/qwen3-0.6b"
   } else {
     "refs/qwen3-0.6b"
   }
