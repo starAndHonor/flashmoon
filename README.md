@@ -140,6 +140,7 @@ cmd/gpubench/                  WebGPU kernel checks + benchmarks (Deno host)
 cmd/qwencpu/                   Qwen3 CPU reference runner + tokenizer oracle test
 cmd/qwengpu/                   Deno REPL chat (MATCH gate + slash commands)
 cmd/webchat/                   browser chat page (chat.html + DOM frontend)
+test/                          all blackbox tests (flash attention, benchmarks, tokenizer oracle)
 docs/                          screenshots
 refs/                          model + HF reference data (gitignored, ~1.5 GB)
 scripts/                       Deno host shims (webgpu_host.js, qwengpu_host.js)
