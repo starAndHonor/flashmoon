@@ -402,6 +402,7 @@ pub fn matmul_shader(s : Int, out : Int, inn : Int) -> String {
     $|}
   src
 }
+
 ///|
 /// RMSNorm: y[r, i] = x[r, i] * rsqrt(mean(x[r,:]^2) + eps) * w[i].
 /// One 256-thread workgroup per row, vec4 loads, shared-memory reduction.
@@ -531,22 +532,32 @@ pub fn add_shader(n : Int) -> String {
 }
 
 ///|
-/// Multi-row causal GQA attention, one workgroup per (q head, query row):
-/// q [rows, hq*hd], kv caches [max_pos, hkv*hd], out [rows, hq*hd].
-/// Row r attends positions 0..pos0+r (params[0] = pos0) — one kernel for
-/// both prefill (rows = prompt, pos0 = 0) and decode (rows = 1).
-///
-/// 128 threads: stage q row, score all m positions (thread-strided rows
-/// of the kv head), shared max/sum reductions, then thread-per-dim
-/// weighted V accumulation. Scores live in shared memory (max_pos * 4B).
-/// Grid: (hq, rows). Requires hd == 128 (thread-per-dim mapping).
-pub fn attn_rows_shader(
+/// Flash prefill attention (tiled online softmax), causal GQA over KV
+/// caches [max_pos, hkv*hd]: q [rows, hq*hd] -> out [rows, hq*hd].
+/// Row i attends keys 0..params[0]+i. One workgroup per (64-row block,
+/// head); thread-per-row with the q row and output accumulator textually
+/// unrolled into registers. K/V tiles (BC=8 rows) are staged cooperatively
+/// in shared memory: 2*8*hd*4 = 8KB at hd=128, under the 16KB workgroup
+/// limit. The score matrix is never materialized (neither global nor
+/// shared) — no max_pos-sized scratch, so the kernel imposes no context cap.
+/// Grid: (ceil(rows/64), hq). Requires hd <= 128.
+pub fn attn_prefill_shader(
+  rows : Int,
   hq : Int,
   hkv : Int,
   hd : Int,
-  max_pos : Int,
   scale : Double,
 ) -> String {
+  let qload = unroll_dv(hd, fn(buf, t) {
+    buf.write_string("qr[\{t}] = q[(i * HQ + head) * HD + \{t}u];")
+  })
+  let dot = dot4(hd, "qr", "ks[j * HD + ")
+  let accum = unroll_dv(hd, fn(buf, c) {
+    buf.write_string("o[\{c}] = o[\{c}] * alpha + p * vs[j * HD + \{c}u];")
+  })
+  let store = unroll_dv(hd, fn(buf, c) {
+    buf.write_string("outp[(i * HQ + head) * HD + \{c}u] = o[\{c}] * inv;")
+  })
   let src =
     $|@group(0) @binding(0) var<storage, read> q : array<f32>;
     $|@group(0) @binding(1) var<storage, read> kc : array<f32>;
@@ -554,15 +565,108 @@ pub fn attn_rows_shader(
     $|@group(0) @binding(3) var<storage, read_write> outp : array<f32>;
     $|@group(0) @binding(4) var<storage, read> params : array<u32>;
     $|
+    $|const ROWS : u32 = \{rows}u;
     $|const HQ : u32 = \{hq}u;
     $|const HKV : u32 = \{hkv}u;
     $|const HD : u32 = \{hd}u;
     $|const GROUP : u32 = \{hq / hkv}u;
     $|const SCALE : f32 = \{scale};
+    $|const BC : u32 = 8u;
+    $|const WG : u32 = 64u;
+    $|const NEG_BIG : f32 = -3.402823466e+38;
     $|
-    $|var<workgroup> qs : array<f32, \{hd}>;
-    $|var<workgroup> sc : array<f32, \{max_pos}>;
-    $|var<workgroup> part : array<f32, 128>;
+    $|var<workgroup> ks : array<f32, BC * HD>;
+    $|var<workgroup> vs : array<f32, BC * HD>;
+    $|
+    $|@compute @workgroup_size(64)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let head = wid.y;
+    $|  let kvh = head / GROUP;
+    $|  let i = wid.x * WG + lid.x;
+    $|  let base = params[0];
+    $|  // deepest causal key bound among this block's rows
+    $|  let j_end = base + min(wid.x * WG + WG, ROWS);
+    $|  var o : array<f32, HD>;
+    $|  var qr : array<f32, HD>;
+    $|  var m_run = NEG_BIG;
+    $|  var l_run = 0.0;
+    $|  if (i < ROWS) {
+    $|    \{qload}
+    $|  }
+    $|  for (var j0 = 0u; j0 < j_end; j0 = j0 + BC) {
+    $|    for (var t = lid.x; t < BC * HD; t = t + WG) {
+    $|      let gj = j0 + t / HD;
+    $|      ks[t] = select(0.0, kc[(gj * HKV + kvh) * HD + t % HD], gj < j_end);
+    $|    }
+    $|    for (var t = lid.x; t < BC * HD; t = t + WG) {
+    $|      let gj = j0 + t / HD;
+    $|      vs[t] = select(0.0, vc[(gj * HKV + kvh) * HD + t % HD], gj < j_end);
+    $|    }
+    $|    workgroupBarrier();
+    $|    if (i < ROWS) {
+    $|      let mlim = base + i + 1u;
+    $|      for (var j = 0u; j < BC; j = j + 1u) {
+    $|        if (j0 + j >= mlim) { break; }
+    $|        \{dot}
+    $|        let s = s_dot * SCALE;
+    $|        let m_new = max(m_run, s);
+    $|        let alpha = exp(m_run - m_new);
+    $|        let p = exp(s - m_new);
+    $|        l_run = l_run * alpha + p;
+    $|        \{accum}
+    $|        m_run = m_new;
+    $|      }
+    $|    }
+    $|    workgroupBarrier();
+    $|  }
+    $|  if (i < ROWS) {
+    $|    let inv = 1.0 / l_run;
+    $|    \{store}
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// Flash-decoding split-KV attention, kernel 1 (partials), decode shape:
+/// q [1, hq*hd] over KV caches [max_pos, hkv*hd], m = params[0] + 1 keys.
+/// Grid: (splits, hq). 128 threads stage the q head in shared, score their
+/// key chunk (shared max/exp/sum passes over a max_pos/splits-entry array
+/// — no global score buffer, no max_pos-sized scratch), then accumulate
+/// the UNNORMALIZED weighted V (thread-per-dim) and write a partial
+/// record (m, l, acc[hd]) at part[(head*S + sp) * (hd+4)]. Empty splits
+/// (j0 >= m) write m = NEG_BIG, l = 0; the combine kernel skips them via
+/// exp(m - M) = 0.
+pub fn attn_decode_shader(
+  hq : Int,
+  hkv : Int,
+  hd : Int,
+  max_pos : Int,
+  splits : Int,
+  scale : Double,
+) -> String {
+  let maxchunk = (max_pos + splits - 1) / splits
+  let src =
+    $|@group(0) @binding(0) var<storage, read> q : array<f32>;
+    $|@group(0) @binding(1) var<storage, read> kc : array<f32>;
+    $|@group(0) @binding(2) var<storage, read> vc : array<f32>;
+    $|@group(0) @binding(3) var<storage, read_write> part : array<f32>;
+    $|@group(0) @binding(4) var<storage, read> params : array<u32>;
+    $|
+    $|const HQ : u32 = \{hq}u;
+    $|const HKV : u32 = \{hkv}u;
+    $|const HD : u32 = \{hd}u;
+    $|const GROUP : u32 = \{hq / hkv}u;
+    $|const SCALE : f32 = \{scale};
+    $|const S : u32 = \{splits}u;
+    $|const NEG_BIG : f32 = -3.402823466e+38;
+    $|
+    $|var<workgroup> qs : array<f32, HD>;
+    $|var<workgroup> sc : array<f32, \{maxchunk}>;
+    $|var<workgroup> red : array<f32, 128>;
     $|var<workgroup> bcast : array<f32, 2>; // 0: max, 1: sum
     $|
     $|@compute @workgroup_size(128)
@@ -570,54 +674,99 @@ pub fn attn_rows_shader(
     $|  @builtin(workgroup_id) wid : vec3<u32>,
     $|  @builtin(local_invocation_id) lid : vec3<u32>,
     $|) {
-    $|  let head = wid.x;
-    $|  let row = wid.y;
+    $|  let sp = wid.x;
+    $|  let head = wid.y;
     $|  let kvh = head / GROUP;
-    $|  let m = params[0] + row + 1u;
-    $|  qs[lid.x] = q[(row * HQ + head) * HD + lid.x];
+    $|  let m = params[0] + 1u;
+    $|  let chunk = (m + S - 1u) / S;
+    $|  let j0 = sp * chunk;
+    $|  let j1 = min(j0 + chunk, m);
+    $|  qs[lid.x] = q[head * HD + lid.x];
     $|  workgroupBarrier();
-    $|  // scores
-    $|  var lmax = -3.402823466e+38;
-    $|  for (var p = lid.x; p < m; p = p + 128u) {
+    $|  var lmax = NEG_BIG;
+    $|  for (var p = j0 + lid.x; p < j1; p = p + 128u) {
     $|    let kb = (p * HKV + kvh) * HD;
     $|    var acc = 0.0;
     $|    for (var d = 0u; d < HD; d = d + 1u) {
     $|      acc = acc + qs[d] * kc[kb + d];
     $|    }
     $|    let s = acc * SCALE;
-    $|    sc[p] = s;
+    $|    sc[p - j0] = s;
     $|    lmax = max(lmax, s);
     $|  }
-    $|  part[lid.x] = lmax;
+    $|  red[lid.x] = lmax;
     $|  workgroupBarrier();
     $|  if (lid.x == 0u) {
-    $|    var mx = -3.402823466e+38;
-    $|    for (var t = 0u; t < 128u; t = t + 1u) { mx = max(mx, part[t]); }
+    $|    var mx = NEG_BIG;
+    $|    for (var t = 0u; t < 128u; t = t + 1u) { mx = max(mx, red[t]); }
     $|    bcast[0] = mx;
     $|  }
     $|  workgroupBarrier();
     $|  let mx = bcast[0];
     $|  var lsum = 0.0;
-    $|  for (var p = lid.x; p < m; p = p + 128u) {
-    $|    let e = exp(sc[p] - mx);
-    $|    sc[p] = e;
+    $|  for (var p = j0 + lid.x; p < j1; p = p + 128u) {
+    $|    let e = exp(sc[p - j0] - mx);
+    $|    sc[p - j0] = e;
     $|    lsum = lsum + e;
     $|  }
-    $|  part[lid.x] = lsum;
+    $|  red[lid.x] = lsum;
     $|  workgroupBarrier();
     $|  if (lid.x == 0u) {
     $|    var sm = 0.0;
-    $|    for (var t = 0u; t < 128u; t = t + 1u) { sm = sm + part[t]; }
+    $|    for (var t = 0u; t < 128u; t = t + 1u) { sm = sm + red[t]; }
     $|    bcast[1] = sm;
     $|  }
     $|  workgroupBarrier();
-    $|  let inv = 1.0 / bcast[1];
-    $|  // weighted V sum, thread per output dim
+    $|  // unnormalized weighted V, thread per output dim (sc reads are
+    $|  // covered by the barrier above)
     $|  var acc = 0.0;
-    $|  for (var p = 0u; p < m; p = p + 1u) {
-    $|    acc = acc + sc[p] * vc[(p * HKV + kvh) * HD + lid.x];
+    $|  for (var p = j0; p < j1; p = p + 1u) {
+    $|    acc = acc + sc[p - j0] * vc[(p * HKV + kvh) * HD + lid.x];
     $|  }
-    $|  outp[(row * HQ + head) * HD + lid.x] = acc * inv;
+    $|  let rec = (head * S + sp) * (HD + 4u);
+    $|  if (lid.x == 0u) {
+    $|    part[rec] = mx;
+    $|    part[rec + 1u] = bcast[1];
+    $|  }
+    $|  part[rec + 2u + lid.x] = acc;
+    $|}
+  src
+}
+
+///|
+/// Flash-decoding kernel 2: merge the S per-split partials into the final
+/// output. One workgroup of hd threads per head (thread-per-dim): the
+/// cross-split online-softmax rescale w_s = exp(m_s - M), out = sum(w_s *
+/// acc_s) / sum(w_s * l_s). Grid: (hq, 1).
+pub fn attn_combine_shader(hq : Int, hd : Int, splits : Int) -> String {
+  let src =
+    $|@group(0) @binding(0) var<storage, read> part : array<f32>;
+    $|@group(0) @binding(1) var<storage, read_write> outp : array<f32>;
+    $|
+    $|const HD : u32 = \{hd}u;
+    $|const S : u32 = \{splits}u;
+    $|const NEG_BIG : f32 = -3.402823466e+38;
+    $|
+    $|@compute @workgroup_size(\{hd})
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let head = wid.x;
+    $|  let d = lid.x;
+    $|  var mmax = NEG_BIG;
+    $|  for (var s = 0u; s < S; s = s + 1u) {
+    $|    mmax = max(mmax, part[(head * S + s) * (HD + 4u)]);
+    $|  }
+    $|  var ltot = 0.0;
+    $|  var acc = 0.0;
+    $|  for (var s = 0u; s < S; s = s + 1u) {
+    $|    let rec = (head * S + s) * (HD + 4u);
+    $|    let w = exp(part[rec] - mmax);
+    $|    ltot = ltot + w * part[rec + 1u];
+    $|    acc = acc + w * part[rec + 2u + d];
+    $|  }
+    $|  outp[head * HD + d] = acc / ltot;
     $|}
   src
 }
@@ -798,12 +947,7 @@ pub fn gemv2_fused_shader(n : Int, inn : Int) -> String {
 /// params[0]. 64 threads = 64 pairs; each thread norms AND rotates its
 /// pair (both halves loaded up front). bf16... no — norm weights are f32.
 /// Grid: (HQ + HKV, 1). Requires hd = 128.
-pub fn qknorm_rope_shader(
-  hq : Int,
-  hkv : Int,
-  hd : Int,
-  eps : Float,
-) -> String {
+pub fn qknorm_rope_shader(hq : Int, hkv : Int, hd : Int, eps : Float) -> String {
   let half = hd / 2
   let src =
     $|@group(0) @binding(0) var<storage, read_write> q : array<f32>;

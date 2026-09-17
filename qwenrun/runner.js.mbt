@@ -2,12 +2,19 @@
 // Copyright Text: 2026 starandhonor
 
 ///| Qwen3-0.6B WebGPU runner (js target) — host-agnostic core shared by the
+
 ///| Deno REPL (cmd/qwengpu) and the browser page (cmd/webchat). Hosts
+
 ///| provide file reading and logging as function values.
+
 ///|
+
 ///| NOTE: no compute dispatch may bind the same buffer at two binding
+
 ///| points (writable-storage aliasing is a Dawn/Chrome validation error —
+
 ///| wgpu/Deno silently tolerates it). All kernels are single-binding
+
 ///| in-place or out-of-place.
 
 ///|
@@ -158,6 +165,8 @@ struct GPUAct {
   gb : @gpu.GPUBuffer
   ub : @gpu.GPUBuffer
   mlpb : @gpu.GPUBuffer
+  /// Flash-decoding partial scratch: (m, l, acc[hd]) per (head, split).
+  apart : @gpu.GPUBuffer
 }
 
 ///|
@@ -169,6 +178,7 @@ fn alloc_act(g : @gpu.Gpu, rows : Int) -> GPUAct {
     kk: g.alloc(rows * NKH * HD),
     vv: g.alloc(rows * NKH * HD),
     attn: g.alloc(rows * NQH * HD),
+    apart: g.alloc(@gpu.Gpu::attn_decode_part_len(NQH, HD)),
     proj: g.alloc(rows * HID),
     gb: g.alloc(rows * INTER),
     ub: g.alloc(rows * INTER),
@@ -209,7 +219,7 @@ fn layer(
   g.copy(x.mlpb, 0, m.kc[li], 0, s * nkv)
   g.copy(x.vv, 0, m.vc[li], 0, s * nkv)
   // attention reads q from attn, writes its output into qq (now free)
-  g.attn_rows(x.attn, m.kc[li], m.vc[li], x.qq, zp, s, NQH, NKH, HD, MAXPOS)
+  g.attn_prefill(x.attn, m.kc[li], m.vc[li], x.qq, zp, s, NQH, NKH, HD)
   g.matmul(x.qq, m.w["o\{li}"], x.proj, s, HID, nq)
   g.add(x.x, x.proj, s * HID)
   g.rmsnorm(x.x, m.w["pn\{li}"], x.xn, s, HID, EPS)
@@ -266,7 +276,18 @@ fn decode_layer(
     HD,
     EPS,
   )
-  g.attn_rows(x.qq, m.kc[li], m.vc[li], x.attn, pos0, 1, NQH, NKH, HD, MAXPOS)
+  g.attn_decode(
+    x.qq,
+    m.kc[li],
+    m.vc[li],
+    x.attn,
+    x.apart,
+    pos0,
+    NQH,
+    NKH,
+    HD,
+    MAXPOS,
+  )
   g.matvec(m.w["o\{li}"], x.attn, x.proj, HID, nq)
   g.add_rmsnorm(x.x, x.proj, m.w["pn\{li}"], x.xn, 1, HID, EPS)
   g.gemv2_fused(x.xn, m.w["gate\{li}"], m.w["up\{li}"], x.gb, x.ub, INTER, HID)
@@ -275,7 +296,8 @@ fn decode_layer(
   g.add_rmsnorm(x.x, x.mlpb, next_norm, x.xn, 1, HID, EPS)
 }
 
-///| Next power of two >= s (min 8) — pipeline-key bucketing for prefill.
+///|
+/// Next power of two >= s (min 8) — pipeline-key bucketing for prefill.
 fn bucket(s : Int) -> Int {
   let mut b = 8
   while b < s {
@@ -535,7 +557,7 @@ fn decode_step(
   verbose : Bool,
   done : (String, Int) -> Unit,
 ) -> Unit {
-  if remaining == 0 || (cur == 151643 || cur == 151645) {
+  if remaining == 0 || cur == 151643 || cur == 151645 {
     let text = r.tk.decode(out) catch { _ => "<decode error>" }
     done(text, out.length())
     return
@@ -566,7 +588,17 @@ fn decode_step(
       on_token(piece)
     }
     decode_step(
-      r, am, pos + 1, remaining - 1, out, sd, on_token, sampler, t0, verbose, done,
+      r,
+      am,
+      pos + 1,
+      remaining - 1,
+      out,
+      sd,
+      on_token,
+      sampler,
+      t0,
+      verbose,
+      done,
     )
   }
   if sampler.temp <= 0.0 {
@@ -595,10 +627,12 @@ pub fn Runner::decode_greedy(
 ) -> Unit {
   let t0 = now_ms()
   let sd = @qwen3.StreamDecoder::new(self.tk)
-  decode_step(
-    self, first, pos, max, [], sd, on_token, sampler, t0, verbose,
-    fn(text, n) { on_done(text, n, (now_ms() - t0).to_int()) },
-  )
+  decode_step(self, first, pos, max, [], sd, on_token, sampler, t0, verbose, fn(
+    text,
+    n,
+  ) {
+    on_done(text, n, (now_ms() - t0).to_int())
+  })
 }
 
 ///|
@@ -628,7 +662,11 @@ pub fn Runner::ask(
   self.readback_logits(fn(got) {
     let pms = (now_ms() - tp).to_int()
     let am = argmax(got)
-    self.decode_greedy(am, ids.length(), max, sampler, false, on_token, fn(text, n, dms) {
+    self.decode_greedy(am, ids.length(), max, sampler, false, on_token, fn(
+      text,
+      n,
+      dms,
+    ) {
       on_done(text, pms, dms, n)
     })
   })
@@ -733,7 +771,9 @@ pub fn check_kernels(
           want[i] = sil * un[i] + un[i]
         }
         log("check silu+add: \{diff(got, want)}")
-        // attn_rows: hq=2 hkv=1 hd=128 max_pos=8 rows=2 pos0=0 (causal)
+        // flash attention: hq=2 hkv=1 hd=128 max_pos=8, shared oracle.
+        // prefill: rows=2 pos0=0 (causal); decode: row 0, pos0=1 (m=2),
+        // 16 splits over 2 keys exercises the empty-split path.
         let hq = 2
         let hd = 128
         let q = rand_vals(2 * hq * hd, 6)
@@ -745,46 +785,63 @@ pub fn check_kernels(
         let ob = g.alloc(2 * hq * hd)
         let zp = g.alloc_u32()
         g.set_u32(zp, 0)
-        g.attn_rows(qb, kb, vb, ob, zp, 2, hq, 1, hd, 8)
-        g.readback(ob, 2 * hq * hd, fn(got) {
-          let want : FixedArray[Float] = FixedArray::make(
-            2 * hq * hd,
-            (0.0 : Float),
-          )
-          let scale = 1.0 / 128.0.sqrt()
-          for r in 0..<2 {
-            for head in 0..<hq {
-              let m = r + 1
-              let mut mx = -3.0e38
-              let sc : FixedArray[Double] = FixedArray::make(m, 0.0)
-              for p in 0..<m {
-                let mut acc = 0.0
-                for d in 0..<hd {
-                  acc = acc +
-                    q[(r * hq + head) * hd + d].to_double() *
-                    kc[p * hd + d].to_double()
-                }
-                sc[p] = acc * scale
-                if sc[p] > mx {
-                  mx = sc[p]
-                }
-              }
-              let mut sum = 0.0
-              for p in 0..<m {
-                sc[p] = @math.exp(sc[p] - mx)
-                sum = sum + sc[p]
-              }
+        g.attn_prefill(qb, kb, vb, ob, zp, 2, hq, 1, hd)
+        // oracle: causal softmax attention in f64
+        let want : FixedArray[Float] = FixedArray::make(
+          2 * hq * hd,
+          (0.0 : Float),
+        )
+        let scale = 1.0 / 128.0.sqrt()
+        for r in 0..<2 {
+          for head in 0..<hq {
+            let m = r + 1
+            let mut mx = -3.0e38
+            let sc : FixedArray[Double] = FixedArray::make(m, 0.0)
+            for p in 0..<m {
+              let mut acc = 0.0
               for d in 0..<hd {
-                let mut acc = 0.0
-                for p in 0..<m {
-                  acc = acc + sc[p] * vc[p * hd + d].to_double()
-                }
-                want[(r * hq + head) * hd + d] = Float::from_double(acc / sum)
+                acc = acc +
+                  q[(r * hq + head) * hd + d].to_double() *
+                  kc[p * hd + d].to_double()
+              }
+              sc[p] = acc * scale
+              if sc[p] > mx {
+                mx = sc[p]
               }
             }
+            let mut sum = 0.0
+            for p in 0..<m {
+              sc[p] = @math.exp(sc[p] - mx)
+              sum = sum + sc[p]
+            }
+            for d in 0..<hd {
+              let mut acc = 0.0
+              for p in 0..<m {
+                acc = acc + sc[p] * vc[p * hd + d].to_double()
+              }
+              want[(r * hq + head) * hd + d] = Float::from_double(acc / sum)
+            }
           }
-          log("check attn_rows: \{diff(got, want)}")
-          next(())
+        }
+        g.readback(ob, 2 * hq * hd, fn(got) {
+          log("check attn_prefill: \{diff(got, want)}")
+          // decode: q row 1 of the fixture (attends keys 0..1 at pos0=1)
+          let qd : FixedArray[Float] = FixedArray::makei(hq * hd, fn(i) {
+            q[hq * hd + i]
+          })
+          let qdb = g.upload(qd)
+          let db = g.alloc(hq * hd)
+          let pb = g.alloc(@gpu.Gpu::attn_decode_part_len(hq, hd))
+          let p1 = g.alloc_u32()
+          g.set_u32(p1, 1)
+          g.attn_decode(qdb, kb, vb, db, pb, p1, hq, 1, hd, 8)
+          g.readback(db, hq * hd, fn(got) {
+            let wantd : FixedArray[Float] = FixedArray::makei(hq * hd, fn(i) {
+              want[hq * hd + i]
+            })
+            log("check attn_decode: \{diff(got, wantd)}")
+            next(())
+          })
         })
       })
     })

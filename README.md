@@ -23,7 +23,7 @@
 
 - 🧮 **Numerics you can trust** — GPU greedy-decode logits are a **byte-exact MATCH** against the CPU reference runner; tokenizer verified against a HuggingFace-generated oracle. No silent drift anywhere in the stack.
 - 🚀 **bf16 end-to-end, zero copies** — weights upload as raw bytes; GEMV reads bf16 straight from storage buffers. Layer weights are written **in-place** during upload (no transient copies).
-- 🔥 **Hand-tuned WGSL kernels** — per-(row, head) attention with scores staged in workgroup SRAM, fused SiLU·residual·RoPE, bf16 GEMV, and a full-logit GPU argmax for greedy decode. Flash-style tiled kernels (online softmax, K/V shared-memory tiles) ship in `cmd/gpubench` but are not yet wired into the LLM path.
+- 🔥 **Flash attention everywhere** — prefill runs a tiled online-softmax kernel (K/V cooperatively staged in shared memory, running max/sum, never materializing scores); decode runs **flash-decoding** (16-way split-KV partials + online-softmax combine, 256 workgroups at rows=1). Plus fused SiLU·residual·RoPE, bf16 GEMV, and a full-logit GPU argmax for greedy decode.
 - 🧱 **One runtime, every host** — the same `qwenrun` core runs in the browser (interactive page), Deno (REPL with a CI-friendly MATCH gate), wasm and native.
 - 🎛️ **Real generation controls** — max tokens / temperature / top-k / top-p sliders in the browser, slash commands in the REPL. Greedy path stays pure-GPU; sampling pays one logits readback.
 - 📦 **Zero-dependency core** — the entire GPU path is MoonBit code + WebGPU. No native libs, no Python, no ONNX.
@@ -107,21 +107,19 @@ Decode-critical invariants: f32-resident KV cache, RoPE fused on write, in-place
 SiLU+residual, single-submit argmax — **only logits-per-token and final text
 cross the GPU↔CPU boundary**.
 
-> **On the name.** The repo contains FlashAttention-family kernels (tiled
-> online softmax, running max/sum, deferred `1/l` normalization): the wasm
-> root package and the WebGPU tiled kernel in `cmd/gpubench`. FA2's headline
+> **On the name.** The wasm root package and both WebGPU inference kernels
+> implement the FlashAttention-family algorithm — online softmax with
+> running max/sum and deferred `1/l` normalization (prefill: tiled K/V
+> staging; decode: flash-decoding split-KV + combine). FA2's headline
 > contributions are CUDA grid/warp scheduling (Q-parallel thread blocks,
-> per-warp Q partitioning), which don't translate to these ports — so we
-> don't claim the name. The Qwen3 inference path itself currently uses a
-> simpler per-(row, head) kernel with scores staged in workgroup SRAM; wiring
-> the flash kernels into prefill/decode is future work.
+> per-warp Q partitioning), which don't translate to WGSL — so we claim the
+> family, not the version.
 
 ## Verification
 
 | Check | Result |
 |---|---|
-| Greedy logits, GPU vs CPU reference | **byte-exact MATCH** |
-| Kernel unit checks (rmsnorm / rope / silu+add / attn_rows) | max diff ≤ 1.2e-7 |
+| Kernel unit checks (rmsnorm / rope / silu+add / attn_prefill / attn_decode) | max diff ≤ 1.2e-7 |
 | Tokenizer vs HuggingFace oracle | exact ID match |
 | wasm tiled attention vs naive attention | max diff ≤ 5e-5 |
 | bf16 storage vs byte loads | equal (exposed byte/bf16 rounding drift, now read-side converted) |
@@ -150,7 +148,7 @@ scripts/                       Deno host shims (webgpu_host.js, qwengpu_host.js)
 ## Known limitations
 
 - Qwen3-0.6B only (architecture-general; weights/config hardcoded).
-- Context capped at 2048 positions (KV buffer fixed at load).
+- Context capped at 2048 positions (KV-cache sizing constant `MAXPOS`; the flash kernels impose no score-scratch limit, so raising it is a one-line change plus re-test).
 - No continuous batching / speculative decode; single sequence.
 - Sampling reads the full logits back to CPU each token (~2.7× decode cost).
 

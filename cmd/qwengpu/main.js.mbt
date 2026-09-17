@@ -2,6 +2,7 @@
 // Copyright Text: 2026 starandhonor
 
 ///| Qwen3-0.6B WebGPU chat — Deno REPL frontend (js target).
+
 ///| Runner core lives in starAndHonor/flashmoon/qwenrun.
 
 ///|
@@ -20,10 +21,10 @@ extern "js" fn deno_read(path : String) -> Bytes =
 extern "js" fn print_raw(s : String) -> Unit =
   #| (s) => { Deno.stdout.writeSync(new TextEncoder().encode(s)); }
 
-
 ///|
 extern "js" fn bytes_to_string(b : Bytes) -> String =
   #|(b) => new TextDecoder().decode(b)
+
 ///|
 extern "js" fn read_line(cb : (String) -> Unit, eof : () -> Unit) -> Unit =
   #| (cb, eof) => {
@@ -106,15 +107,24 @@ fn gate(r : @qwenrun.Runner) -> Unit raise Error {
       return
     }
     // sample decode of the gate prompt, then drop into the REPL
-    r.decode_greedy(am, ids.length(), 16, @qwenrun.Sampler::greedy(), true, fn(_) { () }, fn(text, n, ms) {
-      post("[decode \{n} tok: \{ms} ms]")
-      post("text: \"\{text}\"")
-      repl(r, { max: 256, sampler: @qwenrun.Sampler::greedy() })
-    })
+    r.decode_greedy(
+      am,
+      ids.length(),
+      16,
+      @qwenrun.Sampler::greedy(),
+      true,
+      fn(_) { () },
+      fn(text, n, ms) {
+        post("[decode \{n} tok: \{ms} ms]")
+        post("text: \"\{text}\"")
+        repl(r, { max: 256, sampler: @qwenrun.Sampler::greedy() })
+      },
+    )
   })
 }
 
-///| REPL-tunable generation settings.
+///|
+/// REPL-tunable generation settings.
 struct Cfg {
   mut max : Int
   mut sampler : @qwenrun.Sampler
@@ -139,21 +149,27 @@ fn repl_cmd(cfg : Cfg, line : String) -> Unit {
     "/max" => cfg.max = @string.parse_int(arg) catch { _ => cfg.max }
     "/temp" =>
       cfg.sampler = @qwenrun.Sampler::new(
-        @string.parse_double(arg) catch { _ => cfg.sampler.temp() },
+        @string.parse_double(arg) catch {
+          _ => cfg.sampler.temp()
+        },
         cfg.sampler.top_k(),
         cfg.sampler.top_p(),
       )
     "/topk" =>
       cfg.sampler = @qwenrun.Sampler::new(
         cfg.sampler.temp(),
-        @string.parse_int(arg) catch { _ => cfg.sampler.top_k() },
+        @string.parse_int(arg) catch {
+          _ => cfg.sampler.top_k()
+        },
         cfg.sampler.top_p(),
       )
     "/topp" =>
       cfg.sampler = @qwenrun.Sampler::new(
         cfg.sampler.temp(),
         cfg.sampler.top_k(),
-        @string.parse_double(arg) catch { _ => cfg.sampler.top_p() },
+        @string.parse_double(arg) catch {
+          _ => cfg.sampler.top_p()
+        },
       )
     "/greedy" => cfg.sampler = @qwenrun.Sampler::greedy()
     _ => post("commands: /max N /temp F /topk K /topp F /greedy")
@@ -164,37 +180,45 @@ fn repl_cmd(cfg : Cfg, line : String) -> Unit {
 ///|
 fn repl(r : @qwenrun.Runner, cfg : Cfg) -> Unit {
   print_raw("\n>>> ")
-  read_line(fn(line) {
-    if line == "quit" || line == "exit" {
-      post("bye")
-      return
-    }
-    if line.trim() == "" {
-      repl(r, cfg)
-      return
-    }
-    if line.has_prefix("/") {
-      repl_cmd(cfg, line)
-      repl(r, cfg)
-      return
-    }
-    r.ask(line, cfg.max, cfg.sampler, print_raw, fn(_, pms, dms, n) {
-      post("")
-      post("[\{pms}ms prefill / \{dms}ms decode, \{n} tok · \{show_cfg(cfg)}]")
-      repl(r, cfg)
-    })
-  }, fn() { post("bye") })
+  read_line(
+    fn(line) {
+      if line == "quit" || line == "exit" {
+        post("bye")
+        return
+      }
+      if line.trim() == "" {
+        repl(r, cfg)
+        return
+      }
+      if line.has_prefix("/") {
+        repl_cmd(cfg, line)
+        repl(r, cfg)
+        return
+      }
+      r.ask(line, cfg.max, cfg.sampler, print_raw, fn(_, pms, dms, n) {
+        post("")
+        post(
+          "[\{pms}ms prefill / \{dms}ms decode, \{n} tok · \{show_cfg(cfg)}]",
+        )
+        repl(r, cfg)
+      })
+    },
+    fn() { post("bye") },
+  )
 }
 
 ///|
 fn main {
-  @gpu.Gpu::init(fn(g) {
-    @qwenrun.check_kernels(g, post, fn(_) {
-      @qwenrun.Runner::boot(g, read_async, "refs/qwen3-0.6b", post, fn(r) {
-        gate(r) catch {
-          e => post("error: \{e}")
-        }
+  @gpu.Gpu::init(
+    fn(g) {
+      @qwenrun.check_kernels(g, post, fn(_) {
+        @qwenrun.Runner::boot(g, read_async, "refs/qwen3-0.6b", post, fn(r) {
+          gate(r) catch {
+            e => post("error: \{e}")
+          }
+        })
       })
-    })
-  }, log=post)
+    },
+    log=post,
+  )
 }

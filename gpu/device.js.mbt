@@ -39,8 +39,13 @@ pub fn Gpu::init(
       log(
         "device maxComputeWorkgroupStorageSize=\{device.max_workgroup_storage()}",
       )
-    device.on_uncaptured_error(fn(msg) { log("GPU ERROR: \{msg}") })
-      cb({ device, queue: device.get_queue(), pipelines: Map([]), batch: { val: None } })
+      device.on_uncaptured_error(fn(msg) { log("GPU ERROR: \{msg}") })
+      cb({
+        device,
+        queue: device.get_queue(),
+        pipelines: Map([]),
+        batch: { val: None },
+      })
     })
   })
 }
@@ -299,7 +304,11 @@ pub fn Gpu::upload_typed(self : Gpu, data : F32Buf) -> GPUBuffer {
 ///|
 /// One u32 of kernel params (rope/attention position base).
 pub fn Gpu::alloc_u32(self : Gpu) -> GPUBuffer {
-  self.device.create_buffer(4, USAGE_STORAGE | USAGE_COPY_DST, mapped_at_creation=false)
+  self.device.create_buffer(
+    4,
+    USAGE_STORAGE | USAGE_COPY_DST,
+    mapped_at_creation=false,
+  )
 }
 
 ///|
@@ -395,10 +404,10 @@ pub fn Gpu::add(self : Gpu, x : GPUBuffer, y : GPUBuffer, n : Int) -> Unit {
 }
 
 ///|
-/// Multi-row causal GQA attention over KV caches [max_pos, hkv*hd].
-/// q [rows, hq*hd] -> out [rows, hq*hd]; row r attends 0..pos0+r where
-/// pos0 = params[0]. Covers prefill (rows = prompt) and decode (rows = 1).
-pub fn Gpu::attn_rows(
+/// Flash prefill attention (tiled online softmax) over KV caches
+/// [max_pos, hkv*hd]: q [rows, hq*hd] -> out [rows, hq*hd], causal with
+/// row r attending keys 0..pos0+r (pos0 = params[0]). See shader.mbt.
+pub fn Gpu::attn_prefill(
   self : Gpu,
   q : GPUBuffer,
   kc : GPUBuffer,
@@ -409,19 +418,73 @@ pub fn Gpu::attn_rows(
   hq : Int,
   hkv : Int,
   hd : Int,
+) -> Unit {
+  if hd > 128 {
+    abort("attn_prefill: register-array accumulator caps hd at 128, got \{hd}")
+  }
+  if hq % hkv != 0 {
+    abort("attn_prefill: hq % hkv != 0")
+  }
+  let smem = 8 * hd * 4 * 2 // BC=8 K + V tiles
+  if smem > self.device.max_workgroup_storage() {
+    abort(
+      "attn_prefill needs \{smem}B workgroup storage, device allows \{self.device.max_workgroup_storage()}B",
+    )
+  }
+  let scale = 1.0 / hd.to_double().sqrt()
+  let p = self.pipeline("attnp:\{rows},\{hq},\{hkv},\{hd}", fn() {
+    attn_prefill_shader(rows, hq, hkv, hd, scale)
+  })
+  self.run_pass(p, [q, kc, vc, out, pos0], (rows + 63) / 64, hq)
+}
+
+///|
+/// KV split count for flash-decoding: 16 heads x 16 splits = 256
+/// workgroups — enough to fill the GPU even at decode (rows = 1).
+pub const ATTN_DECODE_SPLITS : Int = 16
+
+///|
+/// Floats of partial scratch that attn_decode needs: hq * splits * (hd+4)
+/// (per (head, split) record: m, l, 2 pad, acc[hd]).
+pub fn Gpu::attn_decode_part_len(hq : Int, hd : Int) -> Int {
+  hq * ATTN_DECODE_SPLITS * (hd + 4)
+}
+
+///|
+/// Flash-decoding attention (split-KV partials + combine), decode shape:
+/// q [1, hq*hd] over KV caches, m = params[0] + 1 keys -> out [1, hq*hd].
+/// `part` is scratch of attn_decode_part_len(hq, hd) floats. The two
+/// dispatches share the caller's pass; in-pass dispatch ordering makes the
+/// combine see the partials.
+pub fn Gpu::attn_decode(
+  self : Gpu,
+  q : GPUBuffer,
+  kc : GPUBuffer,
+  vc : GPUBuffer,
+  out : GPUBuffer,
+  part : GPUBuffer,
+  pos0 : GPUBuffer,
+  hq : Int,
+  hkv : Int,
+  hd : Int,
   max_pos : Int,
 ) -> Unit {
   if hd != 128 {
-    abort("attn_rows: only hd=128 (thread-per-dim) is implemented, got \{hd}")
+    abort("attn_decode: only hd=128 (thread-per-dim) is implemented, got \{hd}")
   }
   if hq % hkv != 0 {
-    abort("attn_rows: hq % hkv != 0")
+    abort("attn_decode: hq % hkv != 0")
   }
   let scale = 1.0 / hd.to_double().sqrt()
-  let p = self.pipeline("attn:\{hq},\{hkv},\{hd},\{max_pos}", fn() {
-    attn_rows_shader(hq, hkv, hd, max_pos, scale)
+  let splits = ATTN_DECODE_SPLITS
+  let p1 = self.pipeline("attnd:\{hq},\{hkv},\{hd},\{max_pos}", fn() {
+    attn_decode_shader(hq, hkv, hd, max_pos, splits, scale)
   })
-  self.run_pass(p, [q, kc, vc, out, pos0], hq, rows)
+  self.run_pass(p1, [q, kc, vc, part, pos0], splits, hq)
+  let p2 = self.pipeline("attnc:\{hq},\{hd}", fn() {
+    attn_combine_shader(hq, hd, splits)
+  })
+  self.run_pass(p2, [part, out], hq, 1)
 }
 
 ///|
@@ -479,7 +542,9 @@ pub fn Gpu::embed_rows(
   if n % 2 != 0 {
     abort("embed_rows: n must be even, got \{n}")
   }
-  let p = self.pipeline("embed:\{rows},\{n}", fn() { embed_rows_shader(rows, n) })
+  let p = self.pipeline("embed:\{rows},\{n}", fn() {
+    embed_rows_shader(rows, n)
+  })
   self.run_pass(p, [emb, ids, dst], (rows * (n / 2) + 255) / 256, 1)
 }
 
@@ -584,7 +649,9 @@ pub fn Gpu::matvec_silu(
   out : Int,
   inn : Int,
 ) -> Unit {
-  let p = self.pipeline("gemvs:\{out}x\{inn}", fn() { gemv_silu_shader(out, inn) })
+  let p = self.pipeline("gemvs:\{out}x\{inn}", fn() {
+    gemv_silu_shader(out, inn)
+  })
   self.run_pass(p, [w, g, u, y], (out + 7) / 8, 1)
 }
 

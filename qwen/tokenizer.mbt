@@ -12,7 +12,9 @@ pub struct Tokenizer {
 }
 
 ///| GPT-2 bytes_to_unicode: printable bytes map to themselves, the rest to
-///| U+0100+n.
+
+///|
+/// U+0100+n.
 fn byte_to_unicode() -> Array[Char] {
   let t : Array[Char] = Array::make(256, ' ')
   let mut n = 0
@@ -39,7 +41,8 @@ test "byte table matches GPT-2 layout" {
   assert_eq(t[0x7F], 'ġ')
 }
 
-///| Parse tokenizer.json. Fails on missing model fields.
+///|
+/// Parse tokenizer.json. Fails on missing model fields.
 pub fn Tokenizer::load(json : String) -> Tokenizer raise {
   let top : Json = @json.parse(json)
   guard top is Object(top) else { fail("tokenizer.json: not an object") }
@@ -124,7 +127,8 @@ fn is_space(c : Char) -> Bool {
   i == 0x3000
 }
 
-///| Non-ASCII punctuation/symbol blocks we must NOT treat as letters.
+///|
+/// Non-ASCII punctuation/symbol blocks we must NOT treat as letters.
 fn is_nonascii_punct(c : Char) -> Bool {
   let i = c.to_int()
   (i >= 0x2000 && i <= 0x206F) || // general punctuation
@@ -151,7 +155,8 @@ fn lower(c : Char) -> Char {
   }
 }
 
-///| (?i:'s|'t|'re|'ve|'m|'ll|'d) at position i; returns contraction length.
+///|
+/// (?i:'s|'t|'re|'ve|'m|'ll|'d) at position i; returns contraction length.
 fn contraction_len(cs : Array[Char], i : Int) -> Int {
   if cs[i] != '\'' {
     return 0
@@ -167,7 +172,8 @@ fn contraction_len(cs : Array[Char], i : Int) -> Int {
   }
 }
 
-///| Split into pre-tokens following the Qwen regex (alternation, first match).
+///|
+/// Split into pre-tokens following the Qwen regex (alternation, first match).
 fn pretokenize(text : String) -> Array[String] {
   let cs = text.to_array()
   let n = cs.length()
@@ -182,7 +188,11 @@ fn pretokenize(text : String) -> Array[String] {
       while i < n && is_letter(cs[i]) {
         i += 1
       }
-    } else if !is_digit(c) && c != '\r' && c != '\n' && i + 1 < n && is_letter(cs[i + 1]) {
+    } else if !is_digit(c) &&
+      c != '\r' &&
+      c != '\n' &&
+      i + 1 < n &&
+      is_letter(cs[i + 1]) {
       // [^\r\n\p{L}\p{N}]?\p{L}+ — punctuation/space glued to a letter run
       i += 1
       while i < n && is_letter(cs[i]) {
@@ -198,7 +208,11 @@ fn pretokenize(text : String) -> Array[String] {
       while i < n && (cs[i] == '\r' || cs[i] == '\n') {
         i += 1
       }
-    } else if c == ' ' && i + 1 < n && !is_space(cs[i + 1]) && !is_letter(cs[i + 1]) && !is_digit(cs[i + 1]) {
+    } else if c == ' ' &&
+      i + 1 < n &&
+      !is_space(cs[i + 1]) &&
+      !is_letter(cs[i + 1]) &&
+      !is_digit(cs[i + 1]) {
       // " ?" prefix of the punctuation rule
       i += 1
       while i < n && !is_space(cs[i]) && !is_letter(cs[i]) && !is_digit(cs[i]) {
@@ -234,7 +248,8 @@ fn pretokenize(text : String) -> Array[String] {
 
 // ---------- BPE ----------
 
-///| Map a pre-token's chars to the byte-level token string.
+///|
+/// Map a pre-token's chars to the byte-level token string.
 fn to_byte_level(s : String) -> String {
   let bytes = @utf8.encode(s)
   let sb = StringBuilder::new()
@@ -245,9 +260,13 @@ fn to_byte_level(s : String) -> String {
   sb.to_string()
 }
 
-///| BPE-merge one byte-level word into vocab token strings.
+///|
+/// BPE-merge one byte-level word into vocab token strings.
 fn Tokenizer::bpe(self : Tokenizer, word : String) -> Array[String] {
-  let mut parts : Array[String] = word.iter().map(fn(c) { c.to_string() }).collect()
+  let mut parts : Array[String] = word
+    .iter()
+    .map(fn(c) { c.to_string() })
+    .collect()
   if parts.length() <= 1 {
     return parts
   }
@@ -272,8 +291,7 @@ fn Tokenizer::bpe(self : Tokenizer, word : String) -> Array[String] {
     let next : Array[String] = []
     let mut k = 0
     while k < parts.length() {
-      if k + 1 < parts.length() &&
-        parts[k] + parts[k + 1] == merged {
+      if k + 1 < parts.length() && parts[k] + parts[k + 1] == merged {
         next.push(merged)
         k += 2
       } else {
@@ -289,7 +307,8 @@ fn Tokenizer::bpe(self : Tokenizer, word : String) -> Array[String] {
   parts
 }
 
-///| Encode text to token ids. Special tokens in the input are not recognized.
+///|
+/// Encode text to token ids. Special tokens in the input are not recognized.
 pub fn Tokenizer::encode(self : Tokenizer, text : String) -> Array[Int] raise {
   let out : Array[Int] = []
   for pre in pretokenize(text) {
@@ -304,7 +323,8 @@ pub fn Tokenizer::encode(self : Tokenizer, text : String) -> Array[Int] raise {
   out
 }
 
-///| Decode token ids back to text (lossy UTF-8).
+///|
+/// Decode token ids back to text (lossy UTF-8).
 pub fn Tokenizer::decode(self : Tokenizer, ids : Array[Int]) -> String raise {
   let bytes : Array[Byte] = []
   for id in ids {
@@ -380,10 +400,9 @@ test "StreamDecoder holds incomplete UTF-8" {
   // token a = bytes [E4 B8] (first two of 中), token b = [AD]
   let ta = String::from_array([t[0xE4], t[0xB8]])
   let tb = String::from_array([t[0xAD]])
-  let json = (
+  let json =
     $|{"model":{"vocab":{"\{ta}":0,"\{tb}":1,"a":2,"<|x|>":3},"merges":[]},
     $| "added_tokens":[{"id":3,"content":"<|x|>"}]}
-  )
   let tk = Tokenizer::load(json)
   let sd = StreamDecoder::new(tk)
   assert_eq(sd.push(0), "") // E4 B8 alone is incomplete
@@ -394,7 +413,8 @@ test "StreamDecoder holds incomplete UTF-8" {
 
 ///|
 test "StreamDecoder plain ascii streams" {
-  let json = #|{"model":{"vocab":{"he":0,"llo":1},"merges":[]}}
+  let json =
+    #|{"model":{"vocab":{"he":0,"llo":1},"merges":[]}}
   let tk = Tokenizer::load(json)
   let sd = StreamDecoder::new(tk)
   assert_eq(sd.push(0), "he")

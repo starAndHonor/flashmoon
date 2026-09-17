@@ -12,7 +12,11 @@ pub fn argmax2_shader(Int) -> String
 
 pub fn attention_shader(Int, Int, Int, Int) -> String
 
-pub fn attn_rows_shader(Int, Int, Int, Int, Double) -> String
+pub fn attn_combine_shader(Int, Int, Int) -> String
+
+pub fn attn_decode_shader(Int, Int, Int, Int, Int, Double) -> String
+
+pub fn attn_prefill_shader(Int, Int, Int, Int, Double) -> String
 
 pub fn combine_shader(Int, Int, Int) -> String
 

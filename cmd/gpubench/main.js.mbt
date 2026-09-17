@@ -28,7 +28,11 @@ fn make_mat(rows : Int, cols : Int, k : Int) -> FixedArray[Float] {
 }
 
 ///|
-fn as_tensor(data : FixedArray[Float], rows : Int, cols : Int) -> @nparray.NpArray {
+fn as_tensor(
+  data : FixedArray[Float],
+  rows : Int,
+  cols : Int,
+) -> @nparray.NpArray {
   @tensor.Tensor::from_host(data, [rows, cols])
 }
 
@@ -53,7 +57,12 @@ fn bf16r(x : Float) -> Float {
 
 ///|
 /// CPU reference: y[out] = W[out,in] @ x[in]
-fn cpu_matvec(w : FixedArray[Float], x : FixedArray[Float], out : Int, inn : Int) -> FixedArray[Float] {
+fn cpu_matvec(
+  w : FixedArray[Float],
+  x : FixedArray[Float],
+  out : Int,
+  inn : Int,
+) -> FixedArray[Float] {
   let y = FixedArray::make(out, 0.0F)
   for o in 0..<out {
     let base = o * inn
@@ -90,7 +99,11 @@ fn cpu_matmul(
 
 ///|
 fn check_attention(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
-  let (q, k, v) = (make_mat(128, 64, 0), make_mat(128, 64, 1), make_mat(128, 64, 2))
+  let (q, k, v) = (
+    make_mat(128, 64, 0),
+    make_mat(128, 64, 1),
+    make_mat(128, 64, 2),
+  )
   let qb = g.upload(q)
   let kb = g.upload(k)
   let vb = g.upload(v)
@@ -119,7 +132,9 @@ fn check_attention(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
       g.sync(fn(_) {
         let dt = now_ms() - t0
         let gflops = 4.0 * 4096.0 * 4096.0 * 64.0 / (dt * 1000.0) / 1000.0
-        post("attention 4096x4096 d=64: \{dt} ms, \{gflops} GFLOP/s (dispatch only)")
+        post(
+          "attention 4096x4096 d=64: \{dt} ms, \{gflops} GFLOP/s (dispatch only)",
+        )
         next(())
       })
     })
@@ -172,7 +187,9 @@ fn check_gemm(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
   let yb = g.alloc(32 * 256)
   g.matmul(xb, wb, yb, 32, 256, 512)
   g.readback(yb, 32 * 256, fn(got) {
-    post("gemm 32x256x512: max_diff=\{max_diff(got, cpu_matmul(x, w, 32, 256, 512))}")
+    post(
+      "gemm 32x256x512: max_diff=\{max_diff(got, cpu_matmul(x, w, 32, 256, 512))}",
+    )
     // Perf: prefill shape s=128, q_proj 2048x1024
     let x2 = make_mat(128, 1024, 9)
     let w2 = make_mat(2048, 1024, 10).map(bf16r)
@@ -196,9 +213,12 @@ fn check_gemm(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
 ///|
 fn main {
   post("gpu ops demo start")
-  @gpu.Gpu::init(fn(g) {
-    check_attention(g, fn(_) {
-      check_gemv(g, fn(_) { check_gemm(g, fn(_) { post("done") }) })
-    })
-  }, log=post)
+  @gpu.Gpu::init(
+    fn(g) {
+      check_attention(g, fn(_) {
+        check_gemv(g, fn(_) { check_gemm(g, fn(_) { post("done") }) })
+      })
+    },
+    log=post,
+  )
 }

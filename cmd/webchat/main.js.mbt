@@ -2,6 +2,7 @@
 // Copyright Text: 2026 starandhonor
 
 ///| Qwen3-0.6B WebGPU chat — browser frontend (js target).
+
 ///| Serves chat.html; the runner core lives in qwenrun.
 
 ///|
@@ -77,31 +78,38 @@ extern "js" fn ui_on_send(cb : (String) -> Unit) -> Unit =
 
 ///|
 fn main {
-  @gpu.Gpu::init(fn(g) {
-    ui_status("downloading model (1.5 GB)…")
-    @qwenrun.Runner::boot(g, fetch_bytes, "/refs/qwen3-0.6b", ui_log, fn(r) {
-      ui_status("ready — Qwen3-0.6B on WebGPU")
-      ui_enable()
-      let busy : Ref[Bool] = { val: false }
-      ui_on_send(fn(text) {
-        if busy.val {
-          return
-        }
-        busy.val = true
-        ui_log(">>> " + text)
-        ui_status("generating…")
-        ui_answer_begin()
-        ui_get_cfg(fn(max, temp, top_k, top_p) {
-          let sampler = @qwenrun.Sampler::new(temp, top_k, top_p)
-          r.ask(text, max, sampler, ui_answer_append, fn(_, pms, dms, n) {
-            busy.val = false
-            let mode = if temp <= 0.0 { "greedy" } else { "temp=\{temp} top_k=\{top_k} top_p=\{top_p}" }
-            ui_status(
-              "prefill \{pms} ms · decode \{dms} ms · \{n} tok (\{if n > 0 { dms / n } else { 0 }} ms/tok) · \{mode}",
-            )
+  @gpu.Gpu::init(
+    fn(g) {
+      ui_status("downloading model (1.5 GB)…")
+      @qwenrun.Runner::boot(g, fetch_bytes, "/refs/qwen3-0.6b", ui_log, fn(r) {
+        ui_status("ready — Qwen3-0.6B on WebGPU")
+        ui_enable()
+        let busy : Ref[Bool] = { val: false }
+        ui_on_send(fn(text) {
+          if busy.val {
+            return
+          }
+          busy.val = true
+          ui_log(">>> " + text)
+          ui_status("generating…")
+          ui_answer_begin()
+          ui_get_cfg(fn(max, temp, top_k, top_p) {
+            let sampler = @qwenrun.Sampler::new(temp, top_k, top_p)
+            r.ask(text, max, sampler, ui_answer_append, fn(_, pms, dms, n) {
+              busy.val = false
+              let mode = if temp <= 0.0 {
+                "greedy"
+              } else {
+                "temp=\{temp} top_k=\{top_k} top_p=\{top_p}"
+              }
+              ui_status(
+                "prefill \{pms} ms · decode \{dms} ms · \{n} tok (\{if n > 0 { dms / n } else { 0 }} ms/tok) · \{mode}",
+              )
+            })
           })
         })
       })
-    })
-  }, log=ui_log)
+    },
+    log=ui_log,
+  )
 }

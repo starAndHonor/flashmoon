@@ -352,7 +352,11 @@ pub extern "js" fn RawBuf::byte_len(self : RawBuf) -> Int =
 
 ///|
 /// Byte view over a Bytes payload (js Bytes = Uint8Array).
-pub extern "js" fn bytes_view(data : Bytes, off : Int, byte_len : Int) -> RawBuf =
+pub extern "js" fn bytes_view(
+  data : Bytes,
+  off : Int,
+  byte_len : Int,
+) -> RawBuf =
   #|(data, off, byte_len) => new Uint8Array(data.buffer, data.byteOffset + off, byte_len)
 
 ///|
