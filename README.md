@@ -2,9 +2,9 @@
 
 # ⚡ flashmoon
 
-**FlashAttention-style attention & full LLM inference, written in pure MoonBit, running on your GPU via WebGPU.**
+**A WebGPU-oriented AI inference foundation library in pure MoonBit — GPU runtime, flash attention, model components — with full Qwen3-0.6B inference as the proof.**
 
-纯 MoonBit 实现的 FlashAttention 式分块注意力与端到端大模型推理——从 wasm 到浏览器里的真实 GPU。
+纯 MoonBit 的 WebGPU AI 推理基础库:GPU 运行时、FlashAttention 注意力库、模型组件——并以 Qwen3-0.6B 端到端推理(浏览器 / Deno / wasm / native)佐证真实可用。
 
 [![MoonBit](https://img.shields.io/badge/language-MoonBit-blue)](https://www.moonbitlang.com)
 [![WebGPU](https://img.shields.io/badge/backend-WebGPU-005a9c)](https://www.w3.org/TR/webgpu/)
@@ -13,13 +13,15 @@
 
 <img src="docs/screenshot.webp" alt="flashmoon webchat — Qwen3-0.6B answering in the browser" width="720"/>
 
-*Qwen3-0.6B chatting in Chromium — weights, tokenizer, kernels and sampler are all MoonBit.*
+*Built on flashmoon: Qwen3-0.6B chatting in Chromium — weights, tokenizer, kernels and sampler are all MoonBit.*
 
 </div>
 
 ---
 
 ## Why flashmoon
+
+MoonBit 生态缺少面向 GPU 的通用计算与 AI 推理基础设施。flashmoon 以**基础库**形态填补这一空白——四层可独立复用的组件(`gpu` 运行时 · `flash`/`flash/gpu` 注意力库 · `qwen`/`qwenrun` 模型组件 · 数值验证体系),Qwen3-0.6B 对话应用只是建立在它之上的一个示例。
 
 - 🧮 **Numerics you can trust** — GPU greedy-decode logits are a **byte-exact MATCH** against the CPU reference runner; tokenizer verified against a HuggingFace-generated oracle. No silent drift anywhere in the stack.
 - 🚀 **bf16 end-to-end, zero copies** — weights upload as raw bytes; GEMV reads bf16 straight from storage buffers. Layer weights are written **in-place** during upload (no transient copies).
@@ -108,22 +110,23 @@ flowchart LR
         D["🖥️ Deno REPL<br/>cmd/qwengpu"]
         K["🔬 Bench host<br/>cmd/gpubench"]
     end
-    subgraph core["Runtime (pure MoonBit)"]
-        R["qwenrun<br/>host-agnostic runner<br/>weights · KV cache · decode loop"]
-        G["gpu<br/>WebGPU runtime<br/>pipelines · buffers · submit"]
+    subgraph lib["flashmoon library (pure MoonBit)"]
+        G["gpu<br/>WebGPU runtime + WGSL kernels<br/>pipelines · buffers · submit"]
+        F["flash + flash/gpu<br/>4D batched attention (MHA/GQA/MQA)<br/>wasm SIMD · native · WebGPU"]
         Q["qwen<br/>safetensors + BPE tokenizer"]
+        R["qwenrun<br/>host-agnostic runner<br/>weights · KV cache · decode loop"]
     end
-    B & D --> R --> G
-    K --> G
-    R --> Q
-    W["Tiled flash attention<br/>root package (wasm/native)"]
+    B & D --> R
+    K --> G & F
+    R --> G & Q
+    F --> G
 ```
 
 Decode-critical invariants: f32-resident KV cache, RoPE fused on write, in-place
 SiLU+residual, single-submit argmax — **only logits-per-token and final text
 cross the GPU↔CPU boundary**.
 
-> **On the name.** The wasm root package and both WebGPU inference kernels
+> **On the name.** The `flash` library and both WebGPU inference kernels
 > implement the FlashAttention-family algorithm — online softmax with
 > running max/sum and deferred `1/l` normalization (prefill: tiled K/V
 > staging; decode: flash-decoding split-KV + combine). FA2's headline
