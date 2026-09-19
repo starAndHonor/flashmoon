@@ -65,7 +65,30 @@ Kernel entry points: `attn_4d` / `flash_attention` (tiled online softmax),
 
 ## Performance
 
-### naive vs flash across common scenarios — `moon run bench --target wasm --release`
+### GPU: naive vs flash (WebGPU, RTX 4060 Laptop, 64×64 tiles)
+
+`moon build --target js && deno run --allow-read scripts/bench_gpu_host.js` —
+a naive GPU kernel that materializes the Sq×Skv score matrix in global memory
+vs the tiled flash kernel that never materializes it (same 4D contract, min
+per-dispatch time over 3 rounds, diff against the CPU oracle).
+
+| Scenario | Shape (B×H/Hkv Sq×Skv×D) | naive | flash | speedup | max diff |
+|---|---|---|---|---|---|
+| chat prompt | 1×8/8 256×256×64 | 1.38 ms | 0.99 ms | 1.40× | 5.4e-7 |
+| long prefill | 1×8/8 2048×2048×64 | 22.38 ms | 16.40 ms | 1.36× | 1.6e-6 |
+| decode step (KV 2k) | 1×8/8 1×2048×64 | 3.31 ms | 1.38 ms | 2.41× | 1.4e-6 |
+| GQA decode (KV 4k) | 1×8/2 1×4096×64 | 6.37 ms | 2.52 ms | 2.52× | 3.6e-6 |
+| MQA decode (KV 4k) | 1×8/1 1×4096×64 | 5.31 ms | 2.52 ms | 2.11× | 3.7e-6 |
+| batched prefill b4 | 4×8/8 256×256×64 | 4.51 ms | 3.85 ms | 1.17× | 6.0e-7 |
+| cached cross-attn | 1×8/8 64×1024×64 | 2.55 ms | 1.36 ms | 1.88× | 9.8e-7 |
+| wide head d=128 | 1×8/8 1024×1024×128 | 47.80 ms | 16.29 ms | 2.93× | 1.7e-6 |
+| odd dims (d80/dv96) | 1×4/2 512×512×80 | 3.70 ms | 2.33 ms | 1.59× | 7.2e-7 |
+
+Flash wins 1.17–2.93× on GPU, peaking at **524 GFLOP/s** (long prefill 2k).
+The gap is widest where the score matrix is large (wide head, decode re-reading
+V) and smallest for small shapes, where both kernels are launch-bound.
+
+### CPU: naive vs flash — `moon run bench --target wasm --release`
 
 | Scenario | Shape (B×H/Hkv Sq×Skv×D) | naive | flash | speedup | max diff |
 |---|---|---|---|---|---|
@@ -91,7 +114,7 @@ tile size (16→256), and runs on native with `--target native`.
 
 | Kernel | Result | Shape |
 |---|---|---|
-| Tiled attention (WebGPU) | **318 GFLOP/s** | 4096×4096, d=64 |
+| Tiled attention (WebGPU) | **322 GFLOP/s** | 4096×4096, d=64, dispatch-only (gpubench) |
 | bf16 GEMV | **2.7 ms (116 GB/s)** | 151936×1024 |
 | wasm tiled attention (f32x4 SIMD) | ~5.4 ms | 256×256, d=64, native-wasm |
 
@@ -104,7 +127,8 @@ End-to-end model inference numbers (Qwen3-0.6B, ~90 tok/s in Chromium) live in
 
 ```bash
 moon build --target js
-deno run --allow-read scripts/webgpu_host.js
+deno run --allow-read scripts/webgpu_host.js      # kernel checks + throughput
+deno run --allow-read scripts/bench_gpu_host.js   # naive vs flash scenario bench
 ```
 
 **🧊 Attention library on wasm/native** (no GPU needed):
@@ -169,6 +193,7 @@ demo/                          downstream model components + LLM demo (see demo/
 demo/qwen/                     safetensors parser + Qwen2 byte-level BPE tokenizer
 demo/qwenrun/                  Qwen3-0.6B runner core (host-agnostic: read/log injected)
 bench/                         naive-vs-flash scenario suite + sweeps (wasm/native)
+bench/gpu/                     naive-vs-flash GPU bench (js/WebGPU, Deno host)
 cmd/fa/                        naive-vs-flash attention demo (wasm/native)
 cmd/gpubench/                  WebGPU kernel checks + benchmarks (Deno host)
 cmd/qwencpu/                   Qwen3 CPU reference runner + tokenizer oracle test
@@ -176,7 +201,7 @@ cmd/qwengpu/                   Deno REPL chat (MATCH gate + slash commands)
 cmd/webchat/                   browser chat page (chat.html + DOM frontend)
 test/                          blackbox tests (flash attention, benchmarks, tokenizer oracle)
 refs/                          model + HF reference data (gitignored, ~1.5 GB)
-scripts/                       Deno host shims (webgpu_host.js, qwengpu_host.js)
+scripts/                       Deno host shims (webgpu_host.js, bench_gpu_host.js, qwengpu_host.js)
 ```
 
 ## License

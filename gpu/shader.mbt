@@ -1300,3 +1300,138 @@ pub fn attn_4d_shader(
     $|}
   src
 }
+
+///|
+/// Naive 4D attention baseline (benchmark reference): stage 1 materializes
+/// the full Sq x Skv score matrix per (batch, head) slice into global
+/// memory. One workgroup per 64 query rows, one thread per row, q row
+/// unrolled into registers. Layout: scores[bh * SQ * SKV + i * SKV + j].
+pub fn attn_naive_scores_shader(
+  b : Int,
+  h : Int,
+  hkv : Int,
+  sq : Int,
+  skv : Int,
+  d : Int,
+  causal : Bool,
+  scale : Double,
+) -> String {
+  let qload = unroll_dv(d, fn(buf, t) {
+    buf.write_string("qr[\{t}] = q[qoff + i * D + \{t}u];")
+  })
+  let dot = dot4(d, "qr", "kc[koff + j * D + ")
+  let src =
+    $|@group(0) @binding(0) var<storage, read> q : array<f32>;
+    $|@group(0) @binding(1) var<storage, read> kc : array<f32>;
+    $|@group(0) @binding(2) var<storage, read_write> sc : array<f32>;
+    $|
+    $|const B : u32 = \{b}u;
+    $|const H : u32 = \{h}u;
+    $|const HKV : u32 = \{hkv}u;
+    $|const GROUP : u32 = \{h / hkv}u;
+    $|const SQ : u32 = \{sq}u;
+    $|const SKV : u32 = \{skv}u;
+    $|const D : u32 = \{d}u;
+    $|const DELTA : u32 = \{skv - sq}u;
+    $|const CAUSAL : bool = \{causal};
+    $|const SCALE : f32 = \{scale};
+    $|const WG : u32 = 64u;
+    $|
+    $|@compute @workgroup_size(64)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let bh = wid.y;
+    $|  let bat = bh / H;
+    $|  let head = bh % H;
+    $|  let kvh = head / GROUP;
+    $|  let i = wid.x * WG + lid.x;
+    $|  if (i >= SQ) { return; }
+    $|  let qoff = bh * SQ * D;
+    $|  let koff = (bat * HKV + kvh) * SKV * D;
+    $|  var mlim = SKV;
+    $|  if (CAUSAL) {
+    $|    mlim = min(i + DELTA + 1u, SKV);
+    $|  }
+    $|  var qr : array<f32, D>;
+    $|  \{qload}
+    $|  let sbase = bh * SQ * SKV + i * SKV;
+    $|  for (var j = 0u; j < mlim; j = j + 1u) {
+    $|    \{dot}
+    $|    sc[sbase + j] = s_dot * SCALE;
+    $|  }
+    $|}
+  src
+}
+
+///|
+/// Naive 4D attention baseline, stage 2: row-wise softmax over the
+/// materialized score matrix (read back from global memory) followed by
+/// PV accumulation reading V straight from global memory. One thread per
+/// query row; DV accumulation unrolled into registers.
+pub fn attn_naive_pv_shader(
+  h : Int,
+  hkv : Int,
+  sq : Int,
+  skv : Int,
+  dv : Int,
+  causal : Bool,
+) -> String {
+  let acc = unroll_dv(dv, fn(buf, c) {
+    buf.write_string("o[\{c}] = o[\{c}] + p * vc[voff + j * DV + \{c}u];")
+  })
+  let store = unroll_dv(dv, fn(buf, c) {
+    buf.write_string("outp[(bh * SQ + i) * DV + \{c}u] = o[\{c}] * inv;")
+  })
+  let src =
+    $|@group(0) @binding(0) var<storage, read> sc : array<f32>;
+    $|@group(0) @binding(1) var<storage, read> vc : array<f32>;
+    $|@group(0) @binding(2) var<storage, read_write> outp : array<f32>;
+    $|
+    $|const H : u32 = \{h}u;
+    $|const HKV : u32 = \{hkv}u;
+    $|const GROUP : u32 = \{h / hkv}u;
+    $|const SQ : u32 = \{sq}u;
+    $|const SKV : u32 = \{skv}u;
+    $|const DV : u32 = \{dv}u;
+    $|const DELTA : u32 = \{skv - sq}u;
+    $|const CAUSAL : bool = \{causal};
+    $|const WG : u32 = 64u;
+    $|const NEG_BIG : f32 = -3.402823466e+38;
+    $|
+    $|@compute @workgroup_size(64)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let bh = wid.y;
+    $|  let bat = bh / H;
+    $|  let head = bh % H;
+    $|  let kvh = head / GROUP;
+    $|  let i = wid.x * WG + lid.x;
+    $|  if (i >= SQ) { return; }
+    $|  let voff = (bat * HKV + kvh) * SKV * DV;
+    $|  let sbase = bh * SQ * SKV + i * SKV;
+    $|  var mlim = SKV;
+    $|  if (CAUSAL) {
+    $|    mlim = min(i + DELTA + 1u, SKV);
+    $|  }
+    $|  var m = NEG_BIG;
+    $|  for (var j = 0u; j < mlim; j = j + 1u) {
+    $|    m = max(m, sc[sbase + j]);
+    $|  }
+    $|  var l = 0.0;
+    $|  for (var j = 0u; j < mlim; j = j + 1u) {
+    $|    l = l + exp(sc[sbase + j] - m);
+    $|  }
+    $|  let inv = 1.0 / l;
+    $|  var o : array<f32, DV>;
+    $|  for (var j = 0u; j < mlim; j = j + 1u) {
+    $|    let p = exp(sc[sbase + j] - m);
+    $|    \{acc}
+    $|  }
+    $|  \{store}
+    $|}
+  src
+}

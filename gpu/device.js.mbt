@@ -742,3 +742,57 @@ pub fn Gpu::attn_4d(
   pass.end()
   self.queue.submit([enc.finish()])
 }
+
+///|
+/// Naive 4D attention baseline: materializes the Sq x Skv score matrix in
+/// global memory (two passes) instead of tiling. Same contract as
+/// `attn_4d`; exists as the benchmark reference point.
+pub fn Gpu::attn_naive_4d(
+  self : Gpu,
+  qb : GPUBuffer,
+  kb : GPUBuffer,
+  vb : GPUBuffer,
+  outb : GPUBuffer,
+  b : Int,
+  h : Int,
+  hkv : Int,
+  sq : Int,
+  skv : Int,
+  d : Int,
+  dv : Int,
+  causal : Bool,
+  scale : Double,
+) -> Unit {
+  if d > 128 || dv > 128 {
+    abort("attn_naive_4d: head dims must be <= 128")
+  }
+  if h % hkv != 0 {
+    abort("attn_naive_4d: kv_heads must divide heads")
+  }
+  if causal && skv < sq {
+    abort("attn_naive_4d: causal mask requires Skv >= Sq")
+  }
+  if b * h > 65535 {
+    abort("attn_naive_4d: B*H exceeds the dispatch grid.y limit")
+  }
+  let sb = self.alloc(b * h * sq * skv)
+  let p1 = self.pipeline(
+    "naive1:\{b},\{h},\{hkv},\{sq},\{skv},\{d},\{causal},\{scale}",
+    fn() { attn_naive_scores_shader(b, h, hkv, sq, skv, d, causal, scale) },
+  )
+  let p2 = self.pipeline("naive2:\{h},\{hkv},\{sq},\{skv},\{dv},\{causal}", fn() {
+    attn_naive_pv_shader(h, hkv, sq, skv, dv, causal)
+  })
+  let bg1 = self.device.make_bind_group(p1, [qb, kb, sb])
+  let bg2 = self.device.make_bind_group(p2, [sb, vb, outb])
+  let enc = self.device.create_command_encoder()
+  let pass = enc.begin_compute_pass()
+  pass.set_pipeline(p1)
+  pass.set_bind_group(0, bg1)
+  pass.dispatch_workgroups((sq + 63) / 64, b * h, 1)
+  pass.set_pipeline(p2)
+  pass.set_bind_group(0, bg2)
+  pass.dispatch_workgroups((sq + 63) / 64, b * h, 1)
+  pass.end()
+  self.queue.submit([enc.finish()])
+}
