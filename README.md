@@ -29,39 +29,129 @@ MoonBit 生态缺少面向 GPU 的通用计算与 AI 推理基础设施。flashm
 moon add starAndHonor/flashmoon
 ```
 
-### 4D batched attention — `flash` (wasm/native) + `flash/gpu` (WebGPU)
+| Import | What you get | Targets |
+|---|---|---|
+| `starAndHonor/flashmoon/flash` | 4D batched attention (MHA/GQA/MQA, causal, cross-attention, any head dim) + naive oracle | wasm (f32x4 SIMD), native, js |
+| `starAndHonor/flashmoon/flash/gpu` | the same 4D contract, dispatched on WebGPU | js |
+| `starAndHonor/flashmoon/gpu` | WebGPU runtime (device, pipeline cache, buffers, submit) + the WGSL kernel library | js |
 
-```moonbit
-// CPU: wasm f32x4 SIMD / native scalar
-let cfg = @flash.AttnConfig::new(heads=8, kv_heads=2, causal=true) // GQA
-let out = @flash.flash_attention(q, k, v, cfg)
-//   q [B,8,Sq,D] · k,v [B,2,Skv,D] -> out [B,8,Sq,Dv]
+### 1. Batched attention — `flash`
 
-// WebGPU backend (js target), same 4D contract
-@flashgpu.flash_attention(g, q, k, v, cfg, fn(out) { ... })
+Tensors are 4D row-major, f32:
+
+```
+q   [B, H,   Sq, D ]      out [B, H, Sq, DV]
+k   [B, HKV, Skv, D ]
+v   [B, HKV, Skv, DV]     out[b,h,i,:] = softmax(q[b,h,i,:] · k[b,kvh,:,:]ᵀ · scale) · v[b,kvh,:,:]
 ```
 
-MHA/GQA/MQA via `heads`/`kv_heads`; causal masks are bottom-right aligned, so
-`Sq < Skv` is attention over cached KV (incremental decode); `scale` defaults
-to `1/sqrt(D)`. A naive reference (`@flash.naive_attention`) ships in the same
-package for oracle testing.
+```moonbit
+import { "starAndHonor/flashmoon/flash" }
 
-### WebGPU compute runtime — `gpu` (js target)
+let cfg = @flash.AttnConfig::new(
+  heads=8,          // query heads H
+  kv_heads=2,       // key/value heads HKV: H -> MHA, H/n -> GQA, 1 -> MQA
+  causal=true,      // bottom-right-aligned causal mask
+  scale=None,       // None = 1/sqrt(D); Some(x) to override
+)
+let out = @flash.flash_attention(q, k, v, cfg, block_rows=64, block_cols=64)
+```
+
+| API | Notes |
+|---|---|
+| `AttnConfig::new(heads~, kv_heads?=heads, causal?=false, scale?=None)` | `kv_heads` must divide `heads`; aborts otherwise |
+| `flash_attention(q, k, v, cfg, block_rows?=64, block_cols?=64)` | tiled online softmax; returns a new `NpArray` |
+| `naive_attention(q, k, v, cfg)` | materializes the score matrix; same result, used as the test oracle |
+
+**Semantics worth knowing**
+
+- **Causal is bottom-right aligned**: row `i` attends keys `0 ..= i + Skv - Sq`.
+  So `Sq == Skv` is ordinary self-attention, `Sq < Skv` is attention over a
+  cached KV prefix (incremental decode), and `Sq > Skv` with `causal=true` is
+  rejected (`abort`).
+- **GQA/MQA** repeat each KV head across `H / HKV` query heads; `kv_heads` here
+  is the *shape* of `k`/`v`, and must match `cfg`.
+- **Head dims are arbitrary** (`D` and `DV` may differ, no alignment required) —
+  the SIMD kernels have a scalar tail. `block_rows`/`block_cols` are tuning
+  knobs only; results are identical up to float summation order (measured
+  ≤ 6e-6 at 4096², see [Performance](#performance)).
+- **Validation is fail-fast**: dims, batch, head counts and `Skv >= Sq` are
+  checked on entry and reported via `abort` with the offending numbers.
+- Scale defaults to `1/sqrt(D)`; the config is shared by the WebGPU backend, so
+  the same `cfg` gives the same math on both.
+
+Runnable: `moon run examples/attn_cpu --target wasm --release` (GQA + causal,
+flash vs naive, prints both outputs and the max diff).
+
+### 2. WebGPU attention — `flash/gpu`
+
+Same 4D contract, one call. It uploads `q`/`k`/`v`, dispatches the tiled kernel
+and hands the result back as an `NpArray` (async callback):
 
 ```moonbit
+import {
+  "starAndHonor/flashmoon/flash",
+  "starAndHonor/flashmoon/flash/gpu" @flashgpu,
+  "starAndHonor/flashmoon/gpu",
+}
+
 @gpu.Gpu::init(fn(g) {
-  let qb = g.upload(q_data) // FixedArray[Float] -> GPUBuffer
-  let outb = g.alloc(n_out)
-  g.attn_4d(qb, kb, vb, outb, b, h, hkv, sq, skv, d, dv, false, scale)
-  g.readback(outb, n_out, fn(data) { ... })
-})
+  @flashgpu.flash_attention(g, q, k, v, cfg, fn(out) {
+    // out : NpArray [B, H, Sq, DV]
+  })
+}, log=println)
 ```
 
-Kernel entry points: `attn_4d` / `flash_attention` (tiled online softmax),
-`attn_prefill` / `attn_decode` (flash-decoding split-KV), `matvec` /
-`matvec_silu` / `gemv2_fused` (bf16 zero-copy), `matmul`, `rmsnorm` /
-`add_rmsnorm`, `rope` / `qknorm_rope`, `silu_mul`, `add`, `embed_rows`,
-`argmax` — everything a Transformer forward pass needs.
+Limits (checked, `abort` on violation): `D, DV <= 128`, `Skv >= Sq` when
+causal, `B*H <= 65535`, and the K/V tiles must fit workgroup storage
+(`8*(D+DV)*4` bytes ≤ device limit; 16 KB on current hardware).
+
+### 3. WebGPU runtime — `gpu`
+
+Use this when the tensors already live on the GPU (timing, layer fusion, model
+runners) or when you need a kernel the attention library doesn't cover.
+
+```moonbit
+let qb = g.upload(q_data)              // FixedArray[Float] -> GPUBuffer
+let outb = g.alloc(b * h * sq * dv)    // f32 storage buffer
+let scale = 1.0 / d.to_double().sqrt()
+g.attn_4d(qb, kb, vb, outb, b, h, hkv, sq, skv, d, dv, /* causal */ true, scale)
+g.sync(fn(_) { ... })                  // wait for the queue
+g.readback(outb, n, fn(data) { ... })  // GPUBuffer -> FixedArray[Float]
+```
+
+`Gpu::init(cb, log=)` acquires the device once per session; `Gpu::begin()` /
+`Gpu::flush()` batch many dispatches into **one** compute pass (per-pass
+overhead dominates on Dawn); `sync` / `readback` are async callbacks.
+
+Kernel entry points — everything a Transformer forward pass needs:
+
+| Kernel | Purpose |
+|---|---|
+| `attn_4d` / `attn_naive_4d` | 4D flash attention / materialized-score baseline |
+| `attn_prefill` / `attn_decode` | runner-shaped attention: prefill + split-KV flash-decoding |
+| `matvec`, `matvec_silu`, `gemv2_fused` | bf16 GEMV (weights read from storage buffers in place) |
+| `matmul` | f32 GEMM |
+| `rmsnorm`, `add_rmsnorm` | normalization (optionally fused with a residual add) |
+| `rope`, `qknorm_rope` | RoPE, optionally fused with QK-norm and KV-cache write |
+| `silu_mul`, `add`, `embed_rows` | elementwise / embedding gather |
+| `argmax` | full-logit GPU argmax (greedy decode without a logits readback) |
+| `copy`, `set_u32`, `alloc_u32`, `upload_u32` | plumbing (offsets, parameters, splits) |
+
+Large weights bypass the MoonBit array size cap via the raw paths:
+`upload_raw(bytes, off, byte_len)` (bf16 bytes straight into storage) and
+`upload_typed(F32Buf)` (an already-converted `Float32Array`).
+
+### Runnable examples
+
+| Command | Shows |
+|---|---|
+| `moon run examples/attn_cpu --target wasm` | 4D GQA + causal on the CPU, flash vs naive |
+| `moon build --target js && deno run --allow-read scripts/attn_gpu_host.js` | the same on WebGPU (`flash/gpu` wrapper **and** device-level `attn_4d`), checked against the CPU oracle |
+| `moon run cmd/fa --target wasm` | slightly larger demo, prints both outputs |
+| `moon run bench --target wasm --release` | naive-vs-flash scenario suite + tile/length/head-dim sweeps |
+| `moon build --target js && deno run --allow-read scripts/bench_gpu_host.js` | naive-vs-flash on the GPU |
+| `moon build --target js && deno run --allow-read scripts/webgpu_host.js` | per-kernel correctness + throughput checks |
 
 ## Performance
 
@@ -135,9 +225,10 @@ deno run --allow-read scripts/bench_gpu_host.js   # naive vs flash scenario benc
 
 ```bash
 moon test                                  # full suite, incl. property tests
-moon run cmd/fa --target wasm              # naive vs flash demo (GQA, causal)
-moon run bench --target wasm --release     # naive-vs-flash scenario + sweep bench
+moon run examples/attn_cpu --target wasm   # minimal 4D GQA + causal example
 ```
+
+More runnable entry points: see [Runnable examples](#runnable-examples).
 
 **💬 LLM chat demo** (browser / Deno REPL, Qwen3-0.6B): see
 [demo/README.md](demo/README.md).
@@ -192,6 +283,7 @@ gpu/                           WebGPU runtime + compute kernels (js target)
 demo/                          downstream model components + LLM demo (see demo/README.md)
 demo/qwen/                     safetensors parser + Qwen2 byte-level BPE tokenizer
 demo/qwenrun/                  Qwen3-0.6B runner core (host-agnostic: read/log injected)
+examples/                      standalone library usage examples (CPU + WebGPU)
 bench/                         naive-vs-flash scenario suite + sweeps (wasm/native)
 bench/gpu/                     naive-vs-flash GPU bench (js/WebGPU, Deno host)
 cmd/fa/                        naive-vs-flash attention demo (wasm/native)
@@ -201,7 +293,7 @@ cmd/qwengpu/                   Deno REPL chat (MATCH gate + slash commands)
 cmd/webchat/                   browser chat page (chat.html + DOM frontend)
 test/                          blackbox tests (flash attention, benchmarks, tokenizer oracle)
 refs/                          model + HF reference data (gitignored, ~1.5 GB)
-scripts/                       Deno host shims (webgpu_host.js, bench_gpu_host.js, qwengpu_host.js)
+scripts/                       Deno host shims (webgpu_host.js, bench_gpu_host.js, attn_gpu_host.js, qwengpu_host.js)
 ```
 
 ## References & licenses

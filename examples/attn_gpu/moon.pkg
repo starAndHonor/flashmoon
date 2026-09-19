@@ -1,0 +1,9 @@
+import {
+  "starAndHonor/flashmoon/flash",
+  "starAndHonor/flashmoon/flash/gpu" @flashgpu,
+  "starAndHonor/flashmoon/gpu",
+  "chnlkw/moonxi-net" @tensor,
+  "chnlkw/moonxi-net/nparray",
+}
+
+pkgtype(kind: "executable")

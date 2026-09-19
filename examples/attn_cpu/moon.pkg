@@ -1,0 +1,7 @@
+import {
+  "starAndHonor/flashmoon/flash",
+  "chnlkw/moonxi-net" @tensor,
+  "chnlkw/moonxi-net/nparray",
+}
+
+pkgtype(kind: "executable")
