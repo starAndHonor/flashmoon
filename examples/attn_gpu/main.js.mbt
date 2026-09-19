@@ -73,13 +73,14 @@ fn main {
   let k = as_tensor4(make_data(b, hkv, skv, d, 1), b, hkv, skv, d)
   let v = as_tensor4(make_data(b, hkv, skv, dv, 2), b, hkv, skv, dv)
   // CPU oracle for the same inputs (identical math, independent kernel).
-  let ref = @flash.naive_attention(q, k, v, cfg)
+  let want = @flash.naive_attention(q, k, v, cfg)
   @gpu.Gpu::init(
     fn(g) {
       // (1) Library wrapper: handles upload + dispatch + readback.
       @flashgpu.flash_attention(g, q, k, v, cfg, fn(out) {
+        let dims = out.value().dims
         post(
-          "flash/gpu  out dims=\{out.value().dims} max|gpu - cpu|=\{max_diff(out.value().data, ref.value().data)}",
+          "flash/gpu  out dims=[\{dims[0]}, \{dims[1]}, \{dims[2]}, \{dims[3]}] max|gpu - cpu|=\{max_diff(out.value().data, want.value().data)}",
         )
         // (2) Device level: tensors already on the GPU, no per-call upload.
         let qb = g.upload(q.value().data)
@@ -89,7 +90,9 @@ fn main {
         let scale = 1.0 / d.to_double().sqrt()
         g.attn_4d(qb, kb, vb, outb, b, h, hkv, sq, skv, d, dv, true, scale)
         g.readback(outb, b * h * sq * dv, fn(got) {
-          post("gpu attn_4d  max|gpu - cpu|=\{max_diff(got, ref.value().data)}")
+          post(
+            "gpu attn_4d  max|gpu - cpu|=\{max_diff(got, want.value().data)}",
+          )
         })
       })
     },

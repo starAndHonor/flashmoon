@@ -48,9 +48,9 @@ fn main {
   // Tiled online-softmax kernel (wasm SIMD / native scalar).
   let out = @flash.flash_attention(q, k, v, cfg, block_rows=64, block_cols=64)
   // Naive reference over the same inputs (materializes the score matrix).
-  let ref = @flash.naive_attention(q, k, v, cfg)
+  let want = @flash.naive_attention(q, k, v, cfg)
   let a = out.value().data
-  let r = ref.value().data
+  let r = want.value().data
   let mut max_diff = 0.0F
   for i in 0..<a.length() {
     let diff = (a[i] - r[i]).abs()
@@ -58,7 +58,10 @@ fn main {
       max_diff = diff
     }
   }
-  println("out dims   = \{out.value().dims}")
+  let dims = out.value().dims
+  println(
+    "out dims   = [\{dims[0]}, \{dims[1]}, \{dims[2]}, \{dims[3]}] (expect [b,h,Sq,DV])",
+  )
   println("out[0]     = \{a[0]}")
   println("naive[0]   = \{r[0]}")
   println("max |flash - naive| = \{max_diff}")
