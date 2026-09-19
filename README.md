@@ -11,10 +11,6 @@
 [![Qwen3-0.6B](https://img.shields.io/badge/model-Qwen3--0.6B-green)](https://huggingface.co/Qwen/Qwen3-0.6B)
 [![License](https://img.shields.io/badge/license-Apache--2.0-orange)](LICENSE)
 
-<img src="docs/screenshot.webp" alt="flashmoon webchat — Qwen3-0.6B answering in the browser" width="720"/>
-
-*Built on flashmoon: Qwen3-0.6B chatting in Chromium — weights, tokenizer, kernels and sampler are all MoonBit.*
-
 </div>
 
 ---
@@ -163,7 +159,6 @@ cmd/qwencpu/                   Qwen3 CPU reference runner + tokenizer oracle tes
 cmd/qwengpu/                   Deno REPL chat (MATCH gate + slash commands)
 cmd/webchat/                   browser chat page (chat.html + DOM frontend)
 test/                          all blackbox tests (flash attention, benchmarks, tokenizer oracle)
-docs/                          screenshots
 refs/                          model + HF reference data (gitignored, ~1.5 GB)
 scripts/                       Deno host shims (webgpu_host.js, qwengpu_host.js)
 ```
