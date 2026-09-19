@@ -204,6 +204,22 @@ refs/                          model + HF reference data (gitignored, ~1.5 GB)
 scripts/                       Deno host shims (webgpu_host.js, bench_gpu_host.js, qwengpu_host.js)
 ```
 
+## References & licenses
+
+All MoonBit code, WGSL kernels and host shims in this repository are original
+work — not a line-by-line port. The following public work was referenced:
+
+| Source | Used for | License |
+|---|---|---|
+| FlashAttention / FlashAttention-2 papers (Dao et al., 2022/2023, [arXiv:2205.14135](https://arxiv.org/abs/2205.14135), [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)) | online-softmax tiling algorithm and kernel structure (`flash`, `gpu` attention kernels) | — |
+| [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) | algorithm reference for the CUDA kernel layout | BSD-3-Clause |
+| [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | model weights + tokenizer config used by the `demo/` runner | Apache-2.0 |
+| [moonxi-net](https://github.com/chnlkw/moonxi-net) | `NpArray` tensor type backing the `flash` package | Apache-2.0 |
+
+FA2's headline contributions are CUDA grid/warp scheduling (Q-parallel thread
+blocks, per-warp Q partitioning), which do not translate to WGSL — the tiled
+kernels here claim the FlashAttention family, not a specific version.
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).

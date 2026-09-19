@@ -13,8 +13,12 @@ Executables live in `cmd/`: `qwencpu`(CPU 参考实现 + 分词器 oracle 测试
 
 ## Quick start
 
-> Requires the model at `refs/Qwen3-0.6B/model.safetensors`
-> (download from [HuggingFace](https://huggingface.co/Qwen/Qwen3-0.6B)).
+> Requires the model at `refs/Qwen3-0.6B/model.safetensors`, weights
+> [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) (Apache-2.0):
+>
+> ```bash
+> huggingface-cli download Qwen/Qwen3-0.6B --local-dir refs/Qwen3-0.6B
+> ```
 
 **💬 Browser chat**
 
