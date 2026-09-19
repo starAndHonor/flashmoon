@@ -79,11 +79,13 @@ Kernel entry points: `attn_4d` / `flash_attention` (tiled online softmax),
 | wide head | 1×8/8 1024×1024×128 | 213.19 ms | 217.23 ms | 0.98× | 2.4e-6 |
 | odd dims (d80/dv96) | 1×4/2 512×512×80 | 20.04 ms | 20.31 ms | 0.99× | 1.0e-6 |
 
-All causal, 64×64 tiles, wasm release, min of 3 runs. Both paths run the same
-f32x4-SIMD dot/axpy kernels, so CPU throughput is on par (0.92–1.02×) — the
-tiled kernel's payoff is memory locality, which materializes on the GPU. The
-`bench/` suite also sweeps sequence length (128→4096), head dim (32/64/128) and
-tile size (16→256).
+All causal, 64×64 tiles, wasm release, min of 3 runs. On the CPU targets both
+paths run through the same dot/axpy kernels (wasm: f32x4 SIMD; native: scalar
+fallback), so throughput is on par — wasm 0.92–1.02× at ~8.6 GFLOP/s, native
+0.93–1.00× at ~1.3 GFLOP/s, with identical output. The tiled kernel's payoff is
+memory locality: it materializes no score matrix, which is what pays off on the
+GPU. `bench/` also sweeps sequence length (128→4096), head dim (32/64/128) and
+tile size (16→256), and runs on native with `--target native`.
 
 ### Kernels (RTX 4060 Laptop, release, dispatch-only unless noted)
 
