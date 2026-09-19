@@ -1,6 +1,6 @@
 import {
   "starAndHonor/flashmoon/gpu",
-  "starAndHonor/flashmoon/qwenrun",
+  "starAndHonor/flashmoon/demo/qwenrun",
 }
 
 pkgtype(kind: "executable")

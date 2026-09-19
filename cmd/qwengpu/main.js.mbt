@@ -3,7 +3,7 @@
 
 ///| Qwen3-0.6B WebGPU chat — Deno REPL frontend (js target).
 
-///| Runner core lives in starAndHonor/flashmoon/qwenrun.
+///| Runner core lives in starAndHonor/flashmoon/demo/qwenrun.
 
 ///|
 extern "js" fn post(s : String) -> Unit =

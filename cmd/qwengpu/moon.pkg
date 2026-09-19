@@ -1,7 +1,7 @@
 import {
   "starAndHonor/flashmoon/gpu",
-  "starAndHonor/flashmoon/qwenrun",
-  "starAndHonor/flashmoon/qwen",
+  "starAndHonor/flashmoon/demo/qwenrun",
+  "starAndHonor/flashmoon/demo/qwen",
   "moonbitlang/core/math",
   "moonbitlang/core/json",
   "moonbitlang/core/string",

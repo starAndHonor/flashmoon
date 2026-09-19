@@ -2,7 +2,7 @@
 // package internals stay next to their package as *_wbtest.mbt.
 import {
   "starAndHonor/flashmoon/flash",
-  "starAndHonor/flashmoon/qwen",
+  "starAndHonor/flashmoon/demo/qwen",
   "chnlkw/moonxi-net" @tensor_test,
   "chnlkw/moonxi-net/nparray" @nparray_test,
   "moonbitlang/core/bench",

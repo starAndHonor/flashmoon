@@ -17,7 +17,7 @@
 
 ## Why flashmoon
 
-MoonBit 生态缺少面向 GPU 的通用计算与 AI 推理基础设施。flashmoon 以**基础库**形态填补这一空白——四层可独立复用的组件(`gpu` 运行时 · `flash`/`flash/gpu` 注意力库 · `qwen`/`qwenrun` 模型组件 · 数值验证体系),Qwen3-0.6B 对话应用只是建立在它之上的一个示例。
+MoonBit 生态缺少面向 GPU 的通用计算与 AI 推理基础设施。flashmoon 以**基础库**形态填补这一空白——可独立复用的库组件(`gpu` WebGPU 运行时 + WGSL 算子库 · `flash`/`flash/gpu` 4D 注意力库 · 数值验证体系);模型相关组件(`demo/qwen` 分词器 + safetensors · `demo/qwenrun` 宿主无关 runner)与 Qwen3-0.6B 对话应用一并放在 `demo/` 与 `cmd/` 下,作为库的真实下游示例。
 
 - 🧮 **Numerics you can trust** — GPU greedy-decode logits are a **byte-exact MATCH** against the CPU reference runner; tokenizer verified against a HuggingFace-generated oracle. No silent drift anywhere in the stack.
 - 🚀 **bf16 end-to-end, zero copies** — weights upload as raw bytes; GEMV reads bf16 straight from storage buffers. Layer weights are written **in-place** during upload (no transient copies).
@@ -109,8 +109,10 @@ flowchart LR
     subgraph lib["flashmoon library (pure MoonBit)"]
         G["gpu<br/>WebGPU runtime + WGSL kernels<br/>pipelines · buffers · submit"]
         F["flash + flash/gpu<br/>4D batched attention (MHA/GQA/MQA)<br/>wasm SIMD · native · WebGPU"]
-        Q["qwen<br/>safetensors + BPE tokenizer"]
-        R["qwenrun<br/>host-agnostic runner<br/>weights · KV cache · decode loop"]
+    end
+    subgraph demo["demo/ — model components"]
+        Q["demo/qwen<br/>safetensors + BPE tokenizer"]
+        R["demo/qwenrun<br/>host-agnostic runner<br/>weights · KV cache · decode loop"]
     end
     B & D --> R
     K --> G & F
@@ -150,8 +152,8 @@ reference on every startup — regressions fail loudly.
 flash/                         4D batched flash attention library (wasm/native, f32x4 SIMD)
 flash/gpu/                     WebGPU backend for the flash library (js target)
 gpu/                           WebGPU runtime + compute kernels (js target)
-qwen/                          safetensors parser + Qwen2 byte-level BPE tokenizer
-qwenrun/                       Qwen3-0.6B runner core (host-agnostic: read/log injected)
+demo/qwen/                     safetensors parser + Qwen2 byte-level BPE tokenizer
+demo/qwenrun/                  Qwen3-0.6B runner core (host-agnostic: read/log injected)
 cmd/fa/                        naive-vs-flash attention demo (wasm/native)
 cmd/bench/                     attention benchmark harness (wasm)
 cmd/gpubench/                  WebGPU kernel checks + benchmarks (Deno host)
