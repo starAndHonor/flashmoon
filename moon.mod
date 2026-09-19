@@ -23,7 +23,7 @@ keywords = [ "webgpu", "attention", "flashattention", "gpu", "inference" ]
 
 preferred_target = "wasm"
 
-description = "WebGPU-oriented AI inference foundation library: WebGPU runtime + WGSL kernel library, 4D batched FlashAttention (MHA/GQA/MQA, causal, cross-attention) on wasm/native/WebGPU, with verified numerics."
+description = "Pure-MoonBit WebGPU runtime and inference kernel library: WGSL kernels, 4D batched FlashAttention (MHA/GQA/MQA, causal, cross-attention), same API across wasm/native/js and WebGPU, with verified numerics."
 
 import {
   "chnlkw/moonxi-net@0.1.1",

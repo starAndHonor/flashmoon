@@ -2,7 +2,7 @@
 
 # ⚡ flashmoon
 
-**A WebGPU-oriented AI inference foundation library in pure MoonBit — GPU runtime & FlashAttention kernels, verified numerics, with full Qwen3-0.6B inference as the downstream proof.**
+**A pure-MoonBit WebGPU runtime and inference kernel library — WGSL kernels & 4D batched FlashAttention, verified numerics, with full Qwen3-0.6B inference as the downstream proof.**
 
 纯 MoonBit 的 WebGPU AI 推理基础库:GPU 运行时 + FlashAttention 算子 + 可验证数值体系,Qwen3-0.6B 端到端推理([demo/](demo/README.md))为真实下游示例。
 
