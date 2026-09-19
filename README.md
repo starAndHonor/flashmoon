@@ -65,7 +65,27 @@ Kernel entry points: `attn_4d` / `flash_attention` (tiled online softmax),
 
 ## Performance
 
-Kernels measured on an RTX 4060 Laptop (release, dispatch-only unless noted):
+### naive vs flash across common scenarios — `moon run bench --target wasm --release`
+
+| Scenario | Shape (B×H/Hkv Sq×Skv×D) | naive | flash | speedup | max diff |
+|---|---|---|---|---|---|
+| chat prompt | 1×8/8 256×256×64 | 7.98 ms | 8.36 ms | 0.96× | 6.6e-7 |
+| long prefill | 1×8/8 2048×2048×64 | 497.98 ms | 488.79 ms | 1.02× | 3.2e-6 |
+| decode step (KV 2k) | 1×8/8 1×2048×64 | 2.95 ms | 3.06 ms | 0.96× | 2.1e-6 |
+| GQA decode (KV 4k) | 1×8/2 1×4096×64 | 2.20 ms | 2.28 ms | 0.97× | 4.6e-6 |
+| MQA decode (KV 4k) | 1×8/1 1×4096×64 | 1.48 ms | 1.61 ms | 0.92× | 4.6e-6 |
+| batched prefill b4 | 4×8/8 256×256×64 | 33.86 ms | 34.94 ms | 0.97× | 6.6e-7 |
+| cached cross-attn | 1×8/8 64×1024×64 | 16.11 ms | 16.66 ms | 0.97× | 1.7e-6 |
+| wide head | 1×8/8 1024×1024×128 | 213.19 ms | 217.23 ms | 0.98× | 2.4e-6 |
+| odd dims (d80/dv96) | 1×4/2 512×512×80 | 20.04 ms | 20.31 ms | 0.99× | 1.0e-6 |
+
+All causal, 64×64 tiles, wasm release, min of 3 runs. Both paths run the same
+f32x4-SIMD dot/axpy kernels, so CPU throughput is on par (0.92–1.02×) — the
+tiled kernel's payoff is memory locality, which materializes on the GPU. The
+`bench/` suite also sweeps sequence length (128→4096), head dim (32/64/128) and
+tile size (16→256).
+
+### Kernels (RTX 4060 Laptop, release, dispatch-only unless noted)
 
 | Kernel | Result | Shape |
 |---|---|---|
@@ -90,7 +110,7 @@ deno run --allow-read scripts/webgpu_host.js
 ```bash
 moon test                                  # full suite, incl. property tests
 moon run cmd/fa --target wasm              # naive vs flash demo (GQA, causal)
-moon run cmd/bench --target wasm --release # attention benchmark harness
+moon run bench --target wasm --release     # naive-vs-flash scenario + sweep bench
 ```
 
 **💬 LLM chat demo** (browser / Deno REPL, Qwen3-0.6B): see
@@ -146,8 +166,8 @@ gpu/                           WebGPU runtime + compute kernels (js target)
 demo/                          downstream model components + LLM demo (see demo/README.md)
 demo/qwen/                     safetensors parser + Qwen2 byte-level BPE tokenizer
 demo/qwenrun/                  Qwen3-0.6B runner core (host-agnostic: read/log injected)
+bench/                         naive-vs-flash scenario suite + sweeps (wasm/native)
 cmd/fa/                        naive-vs-flash attention demo (wasm/native)
-cmd/bench/                     attention benchmark harness (wasm)
 cmd/gpubench/                  WebGPU kernel checks + benchmarks (Deno host)
 cmd/qwencpu/                   Qwen3 CPU reference runner + tokenizer oracle test
 cmd/qwengpu/                   Deno REPL chat (MATCH gate + slash commands)
