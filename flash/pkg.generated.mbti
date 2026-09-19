@@ -6,13 +6,20 @@ import {
 }
 
 // Values
-pub fn flash_attention(@nparray.NpArray, @nparray.NpArray, @nparray.NpArray, block_rows? : Int, block_cols? : Int) -> @nparray.NpArray
+pub fn flash_attention(@nparray.NpArray, @nparray.NpArray, @nparray.NpArray, AttnConfig, block_rows? : Int, block_cols? : Int) -> @nparray.NpArray
 
-pub fn naive_attention(@nparray.NpArray, @nparray.NpArray, @nparray.NpArray) -> @nparray.NpArray
+pub fn naive_attention(@nparray.NpArray, @nparray.NpArray, @nparray.NpArray, AttnConfig) -> @nparray.NpArray
 
 // Errors
 
 // Types and methods
+pub struct AttnConfig {
+  heads : Int
+  kv_heads : Int
+  causal : Bool
+  scale : Float?
+}
+pub fn AttnConfig::new(heads~ : Int, kv_heads? : Int, causal? : Bool, scale? : Float?) -> Self
 
 // Type aliases
 

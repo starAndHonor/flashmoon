@@ -24,6 +24,7 @@
 - 🧮 **Numerics you can trust** — GPU greedy-decode logits are a **byte-exact MATCH** against the CPU reference runner; tokenizer verified against a HuggingFace-generated oracle. No silent drift anywhere in the stack.
 - 🚀 **bf16 end-to-end, zero copies** — weights upload as raw bytes; GEMV reads bf16 straight from storage buffers. Layer weights are written **in-place** during upload (no transient copies).
 - 🔥 **Flash attention everywhere** — prefill runs a tiled online-softmax kernel (K/V cooperatively staged in shared memory, running max/sum, never materializing scores); decode runs **flash-decoding** (16-way split-KV partials + online-softmax combine, 256 workgroups at rows=1). Plus fused SiLU·residual·RoPE, bf16 GEMV, and a full-logit GPU argmax for greedy decode.
+- 📐 **`flash`: a standalone attention library** — batched 4D MHA/GQA/MQA over `[B,H,S,D]` tensors, bottom-right causal masks, cross-attention with cached KV, arbitrary head dims; f32x4-SIMD wasm/native kernels plus a WebGPU backend (`flash/gpu`). One `moon add`, no framework attached.
 - 🧱 **One runtime, every host** — the same `qwenrun` core runs in the browser (interactive page), Deno (REPL with a CI-friendly MATCH gate), wasm and native.
 - 🎛️ **Real generation controls** — max tokens / temperature / top-k / top-p sliders in the browser, slash commands in the REPL. Greedy path stays pure-GPU; sampling pays one logits readback.
 - 📦 **Zero-dependency core** — the entire GPU path is MoonBit code + WebGPU. No native libs, no Python, no ONNX.
@@ -39,6 +40,21 @@ Measured on an RTX 4060 Laptop (release build, Qwen3-0.6B, short prompts):
 | Tiled attention (WebGPU) | — | **318 GFLOP/s** | 4096×4096, d=64, dispatch-only |
 | GEMV 151936×1024 bf16 | — | **2.7 ms (116 GB/s)** | dispatch-only |
 | wasm tiled attention (f32x4 SIMD) | — | ~5.4 ms | 256×256, d=64, native-wasm |
+
+## Use it as a library
+
+```moonbit
+// CPU (wasm f32x4 SIMD / native scalar), moon add starAndHonor/flashmoon
+let cfg = @flash.AttnConfig::new(heads=8, kv_heads=2, causal=true) // GQA
+let out = @flash.flash_attention(q, k, v, cfg)
+//   q [B,8,Sq,D] · k,v [B,2,Skv,D] -> out [B,8,Sq,Dv]
+
+// WebGPU backend (js target)
+@flashgpu.flash_attention(g, q, k, v, cfg, fn(out) { ... })
+```
+
+Naive-vs-flash numerical oracle included (`@flash.naive_attention`); causal
+masks are bottom-right aligned, so `Sq < Skv` is attention over cached KV.
 
 ## Quick start
 
@@ -122,6 +138,8 @@ cross the GPU↔CPU boundary**.
 | Kernel unit checks (rmsnorm / rope / silu+add / attn_prefill / attn_decode) | max diff ≤ 1.2e-7 |
 | Tokenizer vs HuggingFace oracle | exact ID match |
 | wasm tiled attention vs naive attention | max diff ≤ 5e-5 |
+| 4D library property tests (GQA/MQA, causal, cross, odd dims; wasm/native) | max diff < 1e-4 |
+| WebGPU flash4d vs naive oracle (4 shape configs, real GPU) | max diff ≤ 3.0e-7 |
 | bf16 storage vs byte loads | equal (exposed byte/bf16 rounding drift, now read-side converted) |
 
 The Deno REPL's MATCH gate compares the first token ID against the CPU
@@ -130,7 +148,8 @@ reference on every startup — regressions fail loudly.
 ## Repository layout
 
 ```
-flash/                         tiled flash attention (wasm/native, f32x4 SIMD) — the original kernel library
+flash/                         4D batched flash attention library (wasm/native, f32x4 SIMD)
+flash/gpu/                     WebGPU backend for the flash library (js target)
 gpu/                           WebGPU runtime + compute kernels (js target)
 qwen/                          safetensors parser + Qwen2 byte-level BPE tokenizer
 qwenrun/                       Qwen3-0.6B runner core (host-agnostic: read/log injected)

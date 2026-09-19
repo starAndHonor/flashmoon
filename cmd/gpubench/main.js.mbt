@@ -33,7 +33,7 @@ fn as_tensor(
   rows : Int,
   cols : Int,
 ) -> @nparray.NpArray {
-  @tensor.Tensor::from_host(data, [rows, cols])
+  @tensor.Tensor::from_host(data, [1, 1, rows, cols])
 }
 
 ///|
@@ -114,6 +114,7 @@ fn check_attention(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
       as_tensor(q, 128, 64),
       as_tensor(k, 128, 64),
       as_tensor(v, 128, 64),
+      @flash.AttnConfig::new(heads=1),
     )
     post("attention 128x128 d=64: max_diff=\{max_diff(got, want.value().data)}")
     let (q2, k2, v2) = (
@@ -211,12 +212,64 @@ fn check_gemm(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
 }
 
 ///|
+/// Fill a 4D [b,h,rows,cols] tensor with the deterministic pattern.
+fn make_mat4(
+  b : Int,
+  h : Int,
+  rows : Int,
+  cols : Int,
+  k : Int,
+) -> @nparray.NpArray {
+  let data = FixedArray::make(b * h * rows * cols, 0.0F)
+  for i in 0..<(b * h * rows) {
+    for j in 0..<cols {
+      data[i * cols + j] = rand_val(i, j, k)
+    }
+  }
+  @tensor.Tensor::from_host(data, [b, h, rows, cols])
+}
+
+///|
+/// Property checks for the WebGPU 4D flash backend vs the CPU naive
+/// oracle: MHA/GQA/MQA, causal, cross-attention with cache, odd dims.
+fn check_flash4d(g : @gpu.Gpu, next : (Unit) -> Unit) -> Unit {
+  let cases : Array[(Int, Int, Int, Int, Int, Int, Int, Bool)] = [
+    (1, 1, 1, 128, 128, 64, 64, false),
+    (2, 4, 2, 64, 64, 32, 32, true),
+    (1, 3, 1, 16, 64, 24, 40, true),
+    (2, 2, 2, 48, 96, 13, 7, false),
+  ]
+  fn run(idx : Int) -> Unit {
+    if idx >= cases.length() {
+      next(())
+      return
+    }
+    let (b, h, hkv, sq, skv, d, dv, causal) = cases[idx]
+    let q = make_mat4(b, h, sq, d, 0)
+    let k = make_mat4(b, hkv, skv, d, 1)
+    let v = make_mat4(b, hkv, skv, dv, 2)
+    let cfg = @flash.AttnConfig::new(heads=h, kv_heads=hkv, causal~)
+    @flashgpu.flash_attention(g, q, k, v, cfg, fn(got) {
+      let want = @flash.naive_attention(q, k, v, cfg)
+      let diff = max_diff(got.value().data, want.value().data)
+      post(
+        "flash4d b\{b} h\{h}/\{hkv} \{sq}x\{skv} d\{d}/\{dv} causal=\{causal}: max_diff=\{diff}",
+      )
+      run(idx + 1)
+    })
+  }
+  run(0)
+}
+
+///|
 fn main {
   post("gpu ops demo start")
   @gpu.Gpu::init(
     fn(g) {
       check_attention(g, fn(_) {
-        check_gemv(g, fn(_) { check_gemm(g, fn(_) { post("done") }) })
+        check_flash4d(g, fn(_) {
+          check_gemv(g, fn(_) { check_gemm(g, fn(_) { post("done") }) })
+        })
       })
     },
     log=post,

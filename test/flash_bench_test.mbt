@@ -1,8 +1,11 @@
 ///|
-/// Benchmarks: naive vs flash at various tile sizes.
+/// Benchmarks: naive vs flash at various tile sizes, single-head and
+/// batched multi-head shapes.
 
 ///|
 fn bench_qkv(
+  b : Int,
+  h : Int,
   n : Int,
   m : Int,
   d : Int,
@@ -17,37 +20,61 @@ fn bench_qkv(
         data[i * cols + j] = rand(i, j, k)
       }
     }
-    @tensor_test.Tensor::from_host(data, [rows, cols])
+    @tensor_test.Tensor::from_host(data, [b, h, rows, cols])
   }
   (mk(n, d, 0), mk(m, d, 1), mk(m, d, 2))
 }
 
 ///|
 test "bench attention 512x512 d=64" (b : @bench.T) {
-  let (q, k, v) = bench_qkv(512, 512, 64)
+  let (q, k, v) = bench_qkv(1, 1, 512, 512, 64)
+  let cfg = @flash.AttnConfig::new(heads=1)
   let naive = fn() {
-    let out = @flash.naive_attention(q, k, v)
+    let out = @flash.naive_attention(q, k, v, cfg)
     b.keep(out)
   }
   b.bench(name="naive", naive)
   let flash16 = fn() {
-    let out = @flash.flash_attention(q, k, v, block_rows=16, block_cols=16)
+    let out = @flash.flash_attention(q, k, v, cfg, block_rows=16, block_cols=16)
     b.keep(out)
   }
   b.bench(name="flash b16", flash16)
   let flash32 = fn() {
-    let out = @flash.flash_attention(q, k, v, block_rows=32, block_cols=32)
+    let out = @flash.flash_attention(q, k, v, cfg, block_rows=32, block_cols=32)
     b.keep(out)
   }
   b.bench(name="flash b32", flash32)
   let flash64 = fn() {
-    let out = @flash.flash_attention(q, k, v, block_rows=64, block_cols=64)
+    let out = @flash.flash_attention(q, k, v, cfg, block_rows=64, block_cols=64)
     b.keep(out)
   }
   b.bench(name="flash b64", flash64)
   let flash128 = fn() {
-    let out = @flash.flash_attention(q, k, v, block_rows=128, block_cols=128)
+    let out = @flash.flash_attention(
+      q,
+      k,
+      v,
+      cfg,
+      block_rows=128,
+      block_cols=128,
+    )
     b.keep(out)
   }
   b.bench(name="flash b128", flash128)
+}
+
+///|
+test "bench attention b2 h8 128x128 d=64 causal" (b : @bench.T) {
+  let (q, k, v) = bench_qkv(2, 8, 128, 128, 64)
+  let cfg = @flash.AttnConfig::new(heads=8, causal=true)
+  let naive = fn() {
+    let out = @flash.naive_attention(q, k, v, cfg)
+    b.keep(out)
+  }
+  b.bench(name="naive mha", naive)
+  let flash64 = fn() {
+    let out = @flash.flash_attention(q, k, v, cfg, block_rows=64, block_cols=64)
+    b.keep(out)
+  }
+  b.bench(name="flash mha b64", flash64)
 }

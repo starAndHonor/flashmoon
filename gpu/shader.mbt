@@ -1185,3 +1185,118 @@ pub fn argmax2_shader(wgs : Int) -> String {
     $|}
   src
 }
+
+///|
+/// Library 4D flash attention (tiled online softmax): q [B,H,Sq,D],
+/// k [B,HKV,Skv,D], v [B,HKV,Skv,DV] -> out [B,H,Sq,DV], optional
+/// bottom-right causal mask (CAUSAL=1: row i sees keys 0..=i+Skv-Sq).
+/// One workgroup per (64-row block, batch*head); thread-per-row with the
+/// q row and output accumulator textually unrolled into registers. K/V
+/// tiles (BC=8 rows) staged cooperatively in shared memory. Scores are
+/// never materialized. Grid: (ceil(Sq/64), B*H). Requires D, DV <= 128.
+pub fn attn_4d_shader(
+  b : Int,
+  h : Int,
+  hkv : Int,
+  sq : Int,
+  skv : Int,
+  d : Int,
+  dv : Int,
+  causal : Bool,
+  scale : Double,
+) -> String {
+  let qload = unroll_dv(d, fn(buf, t) {
+    buf.write_string("qr[\{t}] = q[qoff + i * D + \{t}u];")
+  })
+  let dot = dot4(d, "qr", "ks[j * D + ")
+  let accum = unroll_dv(dv, fn(buf, c) {
+    buf.write_string("o[\{c}] = o[\{c}] * alpha + p * vs[j * DV + \{c}u];")
+  })
+  let store = unroll_dv(dv, fn(buf, c) {
+    buf.write_string("outp[(bh * SQ + i) * DV + \{c}u] = o[\{c}] * inv;")
+  })
+  let src =
+    $|@group(0) @binding(0) var<storage, read> q : array<f32>;
+    $|@group(0) @binding(1) var<storage, read> kc : array<f32>;
+    $|@group(0) @binding(2) var<storage, read> vc : array<f32>;
+    $|@group(0) @binding(3) var<storage, read_write> outp : array<f32>;
+    $|
+    $|const B : u32 = \{b}u;
+    $|const H : u32 = \{h}u;
+    $|const HKV : u32 = \{hkv}u;
+    $|const GROUP : u32 = \{h / hkv}u;
+    $|const SQ : u32 = \{sq}u;
+    $|const SKV : u32 = \{skv}u;
+    $|const D : u32 = \{d}u;
+    $|const DV : u32 = \{dv}u;
+    $|const DELTA : u32 = \{skv - sq}u; // SKV >= SQ when causal
+    $|const CAUSAL : bool = \{causal};
+    $|const SCALE : f32 = \{scale};
+    $|const BC : u32 = 8u;
+    $|const WG : u32 = 64u;
+    $|const NEG_BIG : f32 = -3.402823466e+38;
+    $|
+    $|var<workgroup> ks : array<f32, BC * D>;
+    $|var<workgroup> vs : array<f32, BC * DV>;
+    $|
+    $|@compute @workgroup_size(64)
+    $|fn main(
+    $|  @builtin(workgroup_id) wid : vec3<u32>,
+    $|  @builtin(local_invocation_id) lid : vec3<u32>,
+    $|) {
+    $|  let bh = wid.y;
+    $|  let bat = bh / H;
+    $|  let head = bh % H;
+    $|  let kvh = head / GROUP;
+    $|  let i = wid.x * WG + lid.x;
+    $|  let qoff = bh * SQ * D;
+    $|  let koff = (bat * HKV + kvh) * SKV * D;
+    $|  let voff = (bat * HKV + kvh) * SKV * DV;
+    $|  // deepest key bound among this block's rows
+    $|  var j_end = SKV;
+    $|  if (CAUSAL) {
+    $|    j_end = min(min(wid.x * WG + WG, SQ) + DELTA, SKV);
+    $|  }
+    $|  var o : array<f32, DV>;
+    $|  var qr : array<f32, D>;
+    $|  var m_run = NEG_BIG;
+    $|  var l_run = 0.0;
+    $|  if (i < SQ) {
+    $|    \{qload}
+    $|  }
+    $|  for (var j0 = 0u; j0 < j_end; j0 = j0 + BC) {
+    $|    for (var t = lid.x; t < BC * D; t = t + WG) {
+    $|      let gj = j0 + t / D;
+    $|      ks[t] = select(0.0, kc[koff + gj * D + t % D], gj < j_end);
+    $|    }
+    $|    for (var t = lid.x; t < BC * DV; t = t + WG) {
+    $|      let gj = j0 + t / DV;
+    $|      vs[t] = select(0.0, vc[voff + gj * DV + t % DV], gj < j_end);
+    $|    }
+    $|    workgroupBarrier();
+    $|    if (i < SQ) {
+    $|      var mlim = SKV;
+    $|      if (CAUSAL) {
+    $|        mlim = min(i + DELTA + 1u, SKV);
+    $|      }
+    $|      for (var j = 0u; j < BC; j = j + 1u) {
+    $|        if (j0 + j >= mlim) { break; }
+    $|        \{dot}
+    $|        let s = s_dot * SCALE;
+    $|        let m_new = max(m_run, s);
+    $|        let alpha = exp(m_run - m_new);
+    $|        let p = exp(s - m_new);
+    $|        l_run = l_run * alpha + p;
+    $|        \{accum}
+    $|        m_run = m_new;
+    $|      }
+    $|    }
+    $|    workgroupBarrier();
+    $|  }
+    $|  if (i < SQ) {
+    $|    let inv = 1.0 / l_run;
+    $|    \{store}
+    $|  }
+    $|}
+  src
+}

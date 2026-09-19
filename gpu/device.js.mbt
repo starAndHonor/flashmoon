@@ -689,3 +689,56 @@ pub fn Gpu::argmax(
     cb(r[0].to_int())
   })
 }
+
+///|
+/// Library 4D flash attention: q [B,H,Sq,D], k [B,HKV,Skv,D],
+/// v [B,HKV,Skv,DV] -> out [B,H,Sq,DV]. One shader compile per
+/// (shape, causal, scale) combo, cached. Requires D, DV <= 128; causal
+/// needs Skv >= Sq (bottom-right mask). Grid: (ceil(Sq/64), B*H).
+pub fn Gpu::attn_4d(
+  self : Gpu,
+  qb : GPUBuffer,
+  kb : GPUBuffer,
+  vb : GPUBuffer,
+  outb : GPUBuffer,
+  b : Int,
+  h : Int,
+  hkv : Int,
+  sq : Int,
+  skv : Int,
+  d : Int,
+  dv : Int,
+  causal : Bool,
+  scale : Double,
+) -> Unit {
+  if d > 128 || dv > 128 {
+    abort("attn_4d: head dims must be <= 128")
+  }
+  if h % hkv != 0 {
+    abort("attn_4d: kv_heads must divide heads")
+  }
+  if causal && skv < sq {
+    abort("attn_4d: causal mask requires Skv >= Sq")
+  }
+  if b * h > 65535 {
+    abort("attn_4d: B*H exceeds the dispatch grid.y limit")
+  }
+  let smem_need = 8 * (d + dv) * 4
+  if smem_need > self.device.max_workgroup_storage() {
+    abort(
+      "attn_4d: needs \{smem_need}B workgroup storage, device allows \{self.device.max_workgroup_storage()}B",
+    )
+  }
+  let p = self.pipeline(
+    "attn4:\{b},\{h},\{hkv},\{sq},\{skv},\{d},\{dv},\{causal},\{scale}",
+    fn() { attn_4d_shader(b, h, hkv, sq, skv, d, dv, causal, scale) },
+  )
+  let bg = self.device.make_bind_group(p, [qb, kb, vb, outb])
+  let enc = self.device.create_command_encoder()
+  let pass = enc.begin_compute_pass()
+  pass.set_pipeline(p)
+  pass.set_bind_group(0, bg)
+  pass.dispatch_workgroups((sq + 63) / 64, b * h, 1)
+  pass.end()
+  self.queue.submit([enc.finish()])
+}
