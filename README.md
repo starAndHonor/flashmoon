@@ -296,6 +296,29 @@ refs/                          model + HF reference data (gitignored, ~1.5 GB)
 scripts/                       Deno host shims (webgpu_host.js, bench_gpu_host.js, attn_gpu_host.js, qwengpu_host.js)
 ```
 
+## Relationship to other MoonBit GPU / ML packages
+
+The MoonBit ecosystem has packages at both ends of this problem — low-level GPU access, and
+CPU-side tensor/training stacks — but nothing in between: a reusable **GPU runtime + kernel library +
+inference algorithm** layer. That is the layer this project occupies.
+
+| Layer | Existing packages | What they provide | Relation to flashmoon |
+|---|---|---|---|
+| Native WebGPU bindings | `Milky2018/wgpu_mbt` (native only, Apache-2.0) | MoonBit bindings for the `wgpu-native` C API: instance/adapter/device/queue/buffer/pipeline/encoder/surface handles; accepts WGSL text for `wgpu-native` to compile; links `libwgpu_native` | Different host, different layer, no dependency in either direction. It stops at the binding layer and ships no kernels, ops, attention or inference code; this project targets js/Deno hosts with zero native dependencies and starts *above* the binding layer. Only the minimal binding needed for compute is included here (3 entry points) |
+| JS-host WebGPU bindings | `tonyfettes/webgpu` (depends on `tonyfettes/js`; no docs on mooncakes, last updated ~1 year ago) | WebGPU call bindings for js hosts | Same host; here the binding ships together with the runtime, kernel library and 4D attention |
+| WGSL toolchain | `Milky2018/wgsl`, `Milky2018/moon_wgsl` (+ naga / naga-oil ports) | Offline WGSL parsing, preprocessing, composition, WESL compilation; pure MoonBit, no GPU access | Complementary: this project emits WGSL source text directly (no DSL dependency); the WGSL frontend can be layered on for static validation — an optional integration point, not a dependency |
+| CUDA backend ops | `chnlkw/moonxi-net-gpu` | CUDA / cuDNN tensor ops and training (`GpuTensor` implementing the moonxi-net traits). Requires a **CUDA-patched MoonBit compiler fork** (the standard toolchain cannot compile CUDA), CUDA 12.8+, cuDNN 9.21+ | Different hardware, toolchain and goal: CUDA native stack on a custom compiler fork for training, vs the standard toolchain with standard WebGPU for inference. Its public interface contains no attention ops |
+| CPU tensor / autograd / training | `chnlkw/moonxi-net`, `lyjttio/moongrad`, `mizchi/nn`, `tonyfettes/torch`, `Milky2018/minigpt` (CPU decoder-only GPT training, with pre-norm multi-head causal self-attention) | Tensors, autograd, training loops, models — all CPU, no GPU backends | Complementary and already connected: `flash` builds directly on moonxi-net's `NpArray` tensor type; these frameworks can call this project's runtime and kernels for GPU inference |
+| CPU linear algebra / BLAS | `Luna-Flow/linear-algebra` (optional OpenBLAS backend), `Kaida-Amethyst/openblas` (C BLAS/LAPACK bindings, native only) | CPU numerical linear algebra, BLAS bindings | Complementary CPU baseline |
+| Pure-CPU inference ops | `Ankaluoer/moon-tensor` | Scalar CPU inference ops (GEMM/Conv1D/activations/norms/pooling) over `Array[Double]`; attention is roadmap-only | Same problem domain, different layer: these ops are CPU-only; here they are GPU (WGSL) plus 4D batched attention. No dependency either way |
+| Abstraction above bindings (precedent) | `emadurandal/rhodonite_webgpu` (depends on `wgpu_mbt`) | 3D rendering abstraction above the binding layer | Same pattern in the graphics domain; this project is the compute/inference counterpart |
+
+**One-line summary of the survey** (2026-09): GPU access in the ecosystem means *bindings* (`wgpu_mbt` native, `tonyfettes/webgpu` js); GPU operators mean a *CUDA training backend* (`moonxi-net-gpu`, custom compiler fork); attention means *CPU training attention* (`Milky2018/minigpt`). No package surveyed provides a WebGPU runtime with a WGSL kernel library, or GPU batched attention inference.
+
+**Relation to `wgpu_mbt` in one line**: it answers "how do I call the GPU from native MoonBit",
+this project answers "how do I run inference on the GPU from any MoonBit host" — the connection point
+is WGSL itself, and neither replaces nor wraps the other.
+
 ## References & licenses
 
 All MoonBit code, WGSL kernels and host shims in this repository are original
@@ -306,7 +329,7 @@ work — not a line-by-line port. The following public work was referenced:
 | FlashAttention / FlashAttention-2 papers (Dao et al., 2022/2023, [arXiv:2205.14135](https://arxiv.org/abs/2205.14135), [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)) | online-softmax tiling algorithm and kernel structure (`flash`, `gpu` attention kernels) | — |
 | [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) | algorithm reference for the CUDA kernel layout | BSD-3-Clause |
 | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | model weights + tokenizer config used by the `demo/` runner | Apache-2.0 |
-| [moonxi-net](https://github.com/chnlkw/moonxi-net) | `NpArray` tensor type backing the `flash` package | Apache-2.0 |
+| [moonxi-net](https://github.com/moonxi-net/moonxi-net) | `NpArray` tensor type backing the `flash` package | MIT |
 
 FA2's headline contributions are CUDA grid/warp scheduling (Q-parallel thread
 blocks, per-warp Q partitioning), which do not translate to WGSL — the tiled
