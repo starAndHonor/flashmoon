@@ -18,6 +18,10 @@ pub fn attn_combine_shader(Int, Int) -> String
 
 pub fn attn_decode_shader(Int, Int, Int, Int, Int, Double) -> String
 
+pub fn attn_naive_pv_shader(Int, Int, Int, Int, Int, Bool) -> String
+
+pub fn attn_naive_scores_shader(Int, Int, Int, Int, Int, Int, Bool, Double) -> String
+
 pub fn attn_prefill_shader(Int, Int, Int, Int, Double) -> String
 
 pub fn combine_shader(Int, Int, Int) -> String

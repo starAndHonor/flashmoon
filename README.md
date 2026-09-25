@@ -269,7 +269,7 @@ flowchart LR
 | Check | Result |
 |---|---|
 | 4D library property tests (GQA/MQA, causal, cross, odd dims; wasm/native) | max diff < 1e-4 |
-| WebGPU flash4d vs naive oracle (4 shape configs, real GPU) | max diff ≤ 3.0e-7 |
+| WebGPU flash4d vs CPU naive oracle (real GPU) | max diff ≤ 3.3e-7 |
 | WebGPU GEMV / GEMM vs CPU oracle | max diff ≤ 1.6e-5 |
 | Kernel unit checks (rmsnorm / rope / silu+add / attn_prefill / attn_decode, f64 oracle) | max diff ≤ 1.2e-7 |
 | bf16 storage vs byte loads | equal (exposed byte/bf16 rounding drift, now read-side converted) |
